@@ -18,10 +18,17 @@ const LOCAL_KEYS = {
 const app = document.getElementById("app");
 
 const state = {
-  activeView: "home",
+  activeView: "enroll",
   apiBaseUrl: normalizeApiBaseUrl(window.localStorage.getItem(LOCAL_KEYS.apiBaseUrl) || "https://roll.underflo.ink"),
   authToken: window.localStorage.getItem(LOCAL_KEYS.token) || "",
   sessionEmail: window.localStorage.getItem(LOCAL_KEYS.email) || "",
+  account: null,
+  authMode: "login",
+  authContext: {
+    email: "",
+    verificationCode: "",
+    resetToken: ""
+  },
   status: {
     tone: "neutral",
     message: "准备就绪。可以先登录，再打开摄像头开始录入。"
@@ -41,50 +48,9 @@ const state = {
     ignored: false,
     sampleNotes: "正脸 / 微侧脸 / 自然表情"
   },
-  faces: [
-    {
-      personId: "stu-001",
-      displayName: "张三",
-      preferred: true,
-      ignored: false,
-      baseWeight: 2,
-      tags: ["class-a"],
-      descriptorCount: 4,
-      sampleCount: 4,
-      updatedAt: "2026-06-18 09:40:00"
-    },
-    {
-      personId: "stu-002",
-      displayName: "李四",
-      preferred: false,
-      ignored: false,
-      baseWeight: 1,
-      tags: ["class-a"],
-      descriptorCount: 3,
-      sampleCount: 3,
-      updatedAt: "2026-06-18 09:52:00"
-    }
-  ],
-  devices: [
-    {
-      deviceCode: "15e27ca2fd9f3b2f-demo",
-      classroom: "Room 301",
-      packageVersion: "2026.06.18.1",
-      devModeEnabled: false,
-      pairedAt: "2026-06-18 10:00:00",
-      lastSeenAt: "2026-06-18 10:20:00"
-    }
-  ],
-  packages: [
-    {
-      version: "2026.06.18.1",
-      isActive: true,
-      notes: "初始班级包",
-      peopleCount: 2,
-      publishedAt: "2026-06-18 10:10:00",
-      operator: "admin@example.com"
-    }
-  ]
+  faces: [],
+  devices: [],
+  packages: []
 };
 
 let liveStream = null;
@@ -199,7 +165,16 @@ async function requestApi(path, { method = "GET", body } = {}) {
 
   if (!response.ok) {
     const message = typeof payload === "string" ? payload : payload?.message || `${response.status}`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.code = typeof payload === "object" ? payload?.code : "";
+
+    if (response.status === 401 && error.code === "AUTH_INVALID_TOKEN") {
+      clearSession();
+      state.authMode = "login";
+    }
+
+    throw error;
   }
 
   return payload;
@@ -336,11 +311,13 @@ async function login(email, password) {
 
     state.authToken = payload.token || "";
     state.sessionEmail = payload.user?.email || email;
+    state.account = payload.user || null;
     persistSession();
     state.status = {
       tone: "success",
       message: "登录成功，正在读取名册和设备信息。"
     };
+    await loadAccount();
     render();
     await refreshAll({ silent: false });
   } catch (error) {
@@ -350,10 +327,143 @@ async function login(email, password) {
 }
 
 function logout() {
+  clearSession();
+  state.authMode = "login";
+  state.status = { tone: "success", message: "已安全退出当前账号。" };
+  render();
+}
+
+function clearSession() {
+  stopCameraTracks();
+  state.camera.enabled = false;
   state.authToken = "";
   state.sessionEmail = "";
+  state.account = null;
+  state.faces = [];
+  state.devices = [];
+  state.packages = [];
   persistSession();
-  setStatus("已退出当前账号。", "success");
+}
+
+async function loadAccount() {
+  const account = await requestApi("/api/auth/me");
+  state.account = account;
+  state.sessionEmail = account.email;
+  persistSession();
+}
+
+async function handleRegister(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const email = String(formData.get("email") || "").trim();
+  const password = String(formData.get("password") || "");
+  const confirmPassword = String(formData.get("confirmPassword") || "");
+
+  if (password !== confirmPassword) {
+    setStatus("两次输入的密码不一致。", "error");
+    return;
+  }
+
+  setLoading(true);
+  try {
+    const payload = await requestApi("/api/auth/register", { method: "POST", body: { email, password } });
+    state.authContext.email = email;
+    state.authContext.verificationCode = payload.verificationCode || "";
+    state.authMode = "verify";
+    state.loading = false;
+    setStatus("账号已创建，请完成邮箱验证。", "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`注册失败：${error.message}`, "error");
+  }
+}
+
+async function handleVerify(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const email = String(formData.get("email") || "").trim();
+  const code = String(formData.get("code") || "").trim();
+
+  setLoading(true);
+  try {
+    await requestApi("/api/auth/verify-email", { method: "POST", body: { email, code } });
+    state.authMode = "login";
+    state.loading = false;
+    setStatus("邮箱验证完成，现在可以登录。", "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`验证失败：${error.message}`, "error");
+  }
+}
+
+async function handleForgotPassword(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const email = String(formData.get("email") || "").trim();
+
+  setLoading(true);
+  try {
+    const payload = await requestApi("/api/auth/forgot-password", { method: "POST", body: { email } });
+    state.authContext.email = email;
+    state.authContext.resetToken = payload.resetToken || "";
+    state.authMode = "reset";
+    state.loading = false;
+    setStatus("重置请求已受理，请设置新密码。", "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`请求失败：${error.message}`, "error");
+  }
+}
+
+async function handleResetPassword(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const token = String(formData.get("token") || "").trim();
+  const password = String(formData.get("password") || "");
+  const confirmPassword = String(formData.get("confirmPassword") || "");
+
+  if (password !== confirmPassword) {
+    setStatus("两次输入的密码不一致。", "error");
+    return;
+  }
+
+  setLoading(true);
+  try {
+    await requestApi("/api/auth/reset-password", { method: "POST", body: { token, password } });
+    state.authMode = "login";
+    state.loading = false;
+    setStatus("密码已重置，请使用新密码登录。", "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`重置失败：${error.message}`, "error");
+  }
+}
+
+async function handleChangePassword(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const currentPassword = String(formData.get("currentPassword") || "");
+  const newPassword = String(formData.get("newPassword") || "");
+  const confirmPassword = String(formData.get("confirmPassword") || "");
+
+  if (newPassword !== confirmPassword) {
+    setStatus("两次输入的新密码不一致。", "error");
+    return;
+  }
+
+  setLoading(true);
+  try {
+    await requestApi("/api/auth/change-password", {
+      method: "POST",
+      body: { currentPassword, newPassword }
+    });
+    event.currentTarget.reset();
+    state.loading = false;
+    setStatus("密码修改成功。", "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`修改失败：${error.message}`, "error");
+  }
 }
 
 function resetDraft() {
@@ -756,6 +866,86 @@ function filteredFaces() {
   });
 }
 
+function renderAuthForm() {
+  if (state.authMode === "register") {
+    return `
+      <form class="auth-form" data-register-form>
+        <div class="auth-heading"><span class="eyebrow">创建账号</span><h1>建立你的点名空间</h1><p>注册后需要验证邮箱，密码至少 8 位。</p></div>
+        <label class="field"><span>邮箱</span><input name="email" type="email" autocomplete="email" required /></label>
+        <label class="field"><span>密码</span><input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <label class="field"><span>确认密码</span><input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <button class="primary-button auth-submit" type="submit">创建账号</button>
+        <button class="text-button" type="button" data-auth-mode="login">已有账号，返回登录</button>
+      </form>`;
+  }
+
+  if (state.authMode === "verify") {
+    return `
+      <form class="auth-form" data-verify-form>
+        <div class="auth-heading"><span class="eyebrow">邮箱验证</span><h1>确认你的邮箱</h1><p>输入发送到邮箱的验证码。</p></div>
+        <label class="field"><span>邮箱</span><input name="email" type="email" value="${escapeHtml(state.authContext.email)}" required /></label>
+        <label class="field"><span>验证码</span><input name="code" inputmode="numeric" autocomplete="one-time-code" value="${escapeHtml(state.authContext.verificationCode)}" required /></label>
+        ${state.authContext.verificationCode ? `<div class="dev-notice">当前服务尚未接入邮件发送，验证码已自动填入。</div>` : ""}
+        <button class="primary-button auth-submit" type="submit">完成验证</button>
+        <button class="text-button" type="button" data-auth-mode="login">稍后验证</button>
+      </form>`;
+  }
+
+  if (state.authMode === "forgot") {
+    return `
+      <form class="auth-form" data-forgot-form>
+        <div class="auth-heading"><span class="eyebrow">找回密码</span><h1>重新获得账号访问权</h1><p>提交注册邮箱，获取密码重置凭据。</p></div>
+        <label class="field"><span>邮箱</span><input name="email" type="email" autocomplete="email" required /></label>
+        <button class="primary-button auth-submit" type="submit">继续</button>
+        <button class="text-button" type="button" data-auth-mode="login">返回登录</button>
+      </form>`;
+  }
+
+  if (state.authMode === "reset") {
+    return `
+      <form class="auth-form" data-reset-form>
+        <div class="auth-heading"><span class="eyebrow">设置新密码</span><h1>更新登录密码</h1><p>新密码至少 8 位，设置后原密码立即失效。</p></div>
+        <label class="field"><span>重置凭据</span><input name="token" value="${escapeHtml(state.authContext.resetToken)}" required /></label>
+        <label class="field"><span>新密码</span><input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <label class="field"><span>确认新密码</span><input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
+        ${state.authContext.resetToken ? `<div class="dev-notice">当前服务尚未接入邮件发送，重置凭据已自动填入。</div>` : ""}
+        <button class="primary-button auth-submit" type="submit">重置密码</button>
+        <button class="text-button" type="button" data-auth-mode="login">取消</button>
+      </form>`;
+  }
+
+  return `
+    <form class="auth-form" data-login-form>
+      <div class="auth-heading"><span class="eyebrow">Smart Roll Call</span><h1>欢迎回来</h1><p>登录后管理人脸名册、教室设备和发布版本。</p></div>
+      <label class="field"><span>邮箱</span><input name="email" type="email" autocomplete="email" value="${escapeHtml(state.authContext.email)}" required /></label>
+      <label class="field"><span>密码</span><input name="password" type="password" autocomplete="current-password" minlength="8" required /></label>
+      <div class="auth-form-row"><label class="remember-copy"><input type="checkbox" checked disabled /> 在此设备保持登录</label><button class="text-button" type="button" data-auth-mode="forgot">忘记密码？</button></div>
+      <button class="primary-button auth-submit" type="submit">登录</button>
+      <button class="text-button" type="button" data-auth-mode="register">没有账号？立即注册</button>
+    </form>`;
+}
+
+function renderAuthScreen() {
+  return `
+    <main class="auth-page">
+      <section class="auth-story">
+        <span class="eyebrow">人脸点名管理</span>
+        <h2>一次录入，稳定同步到每一台教室设备。</h2>
+        <p>账号用于保护人脸名册和发布权限。所有业务操作都需要登录后进行。</p>
+        <div class="auth-steps"><span>实时采集</span><span>名册管理</span><span>设备同步</span></div>
+      </section>
+      <section class="auth-card">
+        ${state.loading ? `<div class="loading-banner">正在处理，请稍候…</div>` : ""}
+        ${renderAuthForm()}
+        <div class="status ${state.status.tone}">${escapeHtml(state.status.message)}</div>
+        <form class="auth-server" data-settings-form>
+          <label class="field"><span>服务地址</span><input name="apiBaseUrl" value="${escapeHtml(state.apiBaseUrl)}" /></label>
+          <button class="ghost-button compact" type="submit">保存</button>
+        </form>
+      </section>
+    </main>`;
+}
+
 function renderTopbar() {
   return `
     <header class="hero-shell">
@@ -898,7 +1088,7 @@ function renderHome() {
             </div>
             <button class="ghost-button compact" type="button" data-edit-face="${escapeHtml(face.personId)}">继续录入</button>
           </article>
-        `).join("")}
+        `).join("") || `<div class="empty-card">还没有录入任何成员，先去“录入人脸”页打开摄像头。</div>`}
       </div>
     </section>
   `;
@@ -914,6 +1104,7 @@ function renderEnroll() {
           <div>
             <div class="section-kicker">实时取景</div>
             <h2>像识别时一样完成采样</h2>
+            <p class="subcopy">这里就是实时录入入口。打开摄像头后，直接对着镜头采样。</p>
           </div>
           <div class="inline-actions">
             ${state.camera.enabled
@@ -1027,7 +1218,7 @@ function renderRoster() {
               <button class="ghost-button compact" type="button" data-edit-face="${escapeHtml(face.personId)}">继续录入</button>
             </div>
           </article>
-        `).join("") || `<div class="empty-card">没有匹配到结果。</div>`}
+        `).join("") || `<div class="empty-card">${state.searchQuery ? "没有匹配到结果。" : "名册还是空的，先去“录入人脸”页采集第一位成员。"}</div>`}
       </div>
     </section>
   `;
@@ -1086,7 +1277,7 @@ function renderDevices() {
               <div class="device-meta">绑定时间：${escapeHtml(formatDate(device.pairedAt))}</div>
               <div class="device-meta">最近同步：${escapeHtml(formatDate(device.lastSeenAt))}</div>
             </article>
-          `).join("") || `<div class="empty-card">还没有绑定任何设备。</div>`}
+          `).join("") || `<div class="empty-card">还没有绑定任何设备，等录入完成并发布版本后再来这里绑定。</div>`}
         </div>
       </div>
     </section>
@@ -1149,7 +1340,7 @@ function renderPublish() {
           <h2>发布历史</h2>
         </div>
       </div>
-      <div class="package-table">
+        <div class="package-table">
         ${state.packages.map((pkg) => `
           <article class="package-row ${pkg.isActive ? "active" : ""}">
             <div>
@@ -1163,47 +1354,46 @@ function renderPublish() {
               <span>${pkg.isActive ? "当前使用中" : "历史版本"}</span>
             </div>
           </article>
-        `).join("")}
+        `).join("") || `<div class="empty-card">还没有任何发布版本。完成录入后即可发布第一版。</div>`}
       </div>
     </section>
   `;
 }
 
 function renderSettings() {
+  const roleLabel = state.account?.role === "admin" ? "管理员" : "编辑人员";
   return `
     <section class="panel panel-split">
-      <form class="form-panel" data-login-form>
+      <section class="form-panel">
         <div class="panel-heading compact-head">
           <div>
-            <div class="section-kicker">账号</div>
-            <h2>${isLoggedIn() ? "当前已连接" : "登录后开始同步"}</h2>
+            <div class="section-kicker">账号中心</div>
+            <h2>登录与权限</h2>
           </div>
-          ${isLoggedIn() ? `<button class="ghost-button" type="button" data-logout>退出</button>` : ""}
+          <button class="ghost-button" type="button" data-logout>退出登录</button>
         </div>
-        ${isLoggedIn()
-          ? `
-            <div class="notice-card">
-              当前账号：${escapeHtml(state.sessionEmail || "未命名账号")}<br />
-              如需重新连接其他服务地址，可以在右侧修改。
-            </div>
-          `
-          : `
-            <div class="form-grid">
-              <label class="field">
-                <span>邮箱</span>
-                <input name="email" type="email" placeholder="admin@example.com" required />
-              </label>
-              <label class="field">
-                <span>密码</span>
-                <input name="password" type="password" placeholder="输入登录密码" required />
-              </label>
-            </div>
-            <div class="inline-actions">
-              <button class="primary-button" type="submit">登录并同步</button>
-            </div>
-          `}
-      </form>
+        <div class="account-summary">
+          <div class="account-avatar">${escapeHtml((state.sessionEmail || "A").slice(0, 1).toUpperCase())}</div>
+          <div><strong>${escapeHtml(state.sessionEmail)}</strong><p>${roleLabel} · 邮箱已验证</p></div>
+        </div>
+        <div class="account-facts">
+          <span>账号创建时间</span><strong>${escapeHtml(formatDate(state.account?.createdAt))}</strong>
+          <span>账号权限</span><strong>${roleLabel}</strong>
+        </div>
+      </section>
 
+      <form class="form-panel" data-change-password-form>
+        <div class="panel-heading compact-head"><div><div class="section-kicker">安全</div><h2>修改密码</h2></div></div>
+        <div class="form-grid">
+          <label class="field field-wide"><span>当前密码</span><input name="currentPassword" type="password" autocomplete="current-password" required /></label>
+          <label class="field"><span>新密码</span><input name="newPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
+          <label class="field"><span>确认新密码</span><input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
+        </div>
+        <div class="inline-actions"><button class="primary-button" type="submit">更新密码</button></div>
+      </form>
+    </section>
+
+    <section class="panel">
       <form class="form-panel" data-settings-form>
         <div class="panel-heading compact-head">
           <div>
@@ -1243,23 +1433,15 @@ function renderMain() {
   }
 }
 
-function renderLoginHint() {
-  if (isLoggedIn()) {
-    return "";
+function render() {
+  if (!isLoggedIn()) {
+    app.innerHTML = renderAuthScreen();
+    bindEvents();
+    return;
   }
 
-  return `
-    <section class="login-hint">
-      <p>你还没有登录。可以先浏览页面结构，真正保存数据前请到“设置”页完成登录。</p>
-      <button class="primary-button" type="button" data-quick-view="settings">去登录</button>
-    </section>
-  `;
-}
-
-function render() {
   app.innerHTML = `
     ${renderTopbar()}
-    ${renderLoginHint()}
     <section class="workspace">
       ${renderNav()}
       <main class="content">
@@ -1274,6 +1456,14 @@ function render() {
 }
 
 function bindEvents() {
+  document.querySelectorAll("[data-auth-mode]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.authMode = button.dataset.authMode;
+      state.status = { tone: "neutral", message: "请填写账号信息。" };
+      render();
+    });
+  });
+
   document.querySelectorAll("[data-nav-view]").forEach((button) => {
     button.addEventListener("click", () => {
       switchView(button.dataset.navView);
@@ -1302,6 +1492,12 @@ function bindEvents() {
       String(formData.get("password") || "").trim()
     );
   });
+
+  document.querySelector("[data-register-form]")?.addEventListener("submit", handleRegister);
+  document.querySelector("[data-verify-form]")?.addEventListener("submit", handleVerify);
+  document.querySelector("[data-forgot-form]")?.addEventListener("submit", handleForgotPassword);
+  document.querySelector("[data-reset-form]")?.addEventListener("submit", handleResetPassword);
+  document.querySelector("[data-change-password-form]")?.addEventListener("submit", handleChangePassword);
 
   document.querySelector("[data-logout]")?.addEventListener("click", logout);
   document.querySelectorAll("[data-refresh-all]").forEach((button) => {
@@ -1348,7 +1544,13 @@ async function init() {
   render();
 
   if (isLoggedIn()) {
-    await refreshAll({ silent: false });
+    try {
+      await loadAccount();
+      await refreshAll({ silent: false });
+    } catch (error) {
+      state.loading = false;
+      setStatus(`登录状态已失效：${error.message}`, "error");
+    }
   }
 }
 

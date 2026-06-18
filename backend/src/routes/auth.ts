@@ -11,7 +11,36 @@ const credentialsSchema = z.object({
   password: z.string().min(8)
 });
 
+const passwordSchema = z.string().min(8).max(128);
+
 export async function registerAuthRoutes(app: FastifyInstance) {
+  app.get("/api/auth/me", { preHandler: app.authenticate }, async (request) => {
+    const user = await prisma.user.findUnique({
+      where: { id: request.authUser!.userId },
+      select: {
+        id: true,
+        email: true,
+        role: true,
+        emailVerified: true,
+        createdAt: true,
+        updatedAt: true
+      }
+    });
+
+    if (!user) {
+      throw new HttpError(404, "AUTH_USER_NOT_FOUND", "The current account no longer exists.");
+    }
+
+    return {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+      emailVerified: user.emailVerified,
+      createdAt: user.createdAt.toISOString(),
+      updatedAt: user.updatedAt.toISOString()
+    };
+  });
+
   app.post("/api/auth/register", async (request, reply) => {
     const body = credentialsSchema.parse(request.body);
     const existingUser = await prisma.user.findUnique({ where: { email: body.email } });
@@ -183,5 +212,70 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       resetToken: token,
       resetTokenExpiresAt: expiresAt.toISOString()
     };
+  });
+
+  app.post("/api/auth/reset-password", async (request) => {
+    const body = z.object({
+      token: z.string().min(16),
+      password: passwordSchema
+    }).parse(request.body);
+
+    const reset = await prisma.passwordReset.findFirst({
+      where: { token: body.token },
+      include: { user: true }
+    });
+
+    if (!reset || reset.usedAt || reset.expiresAt.getTime() < Date.now()) {
+      throw new HttpError(400, "AUTH_INVALID_RESET_TOKEN", "The password reset token is invalid or expired.");
+    }
+
+    const passwordHash = await bcrypt.hash(body.password, 10);
+    await prisma.$transaction([
+      prisma.user.update({
+        where: { id: reset.userId },
+        data: { passwordHash }
+      }),
+      prisma.passwordReset.update({
+        where: { id: reset.id },
+        data: { usedAt: new Date() }
+      })
+    ]);
+
+    await writeAuditLog(prisma, request, {
+      action: "reset_password",
+      entityType: "user",
+      entityId: reset.userId
+    });
+
+    return { reset: true };
+  });
+
+  app.post("/api/auth/change-password", { preHandler: app.authenticate }, async (request) => {
+    const body = z.object({
+      currentPassword: z.string().min(1),
+      newPassword: passwordSchema
+    }).parse(request.body);
+
+    if (body.currentPassword === body.newPassword) {
+      throw new HttpError(400, "AUTH_PASSWORD_UNCHANGED", "The new password must be different from the current password.");
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: request.authUser!.userId } });
+    if (!user || !(await bcrypt.compare(body.currentPassword, user.passwordHash))) {
+      throw new HttpError(401, "AUTH_INVALID_CURRENT_PASSWORD", "The current password is incorrect.");
+    }
+
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash: await bcrypt.hash(body.newPassword, 10) }
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "change_password",
+      entityType: "user",
+      entityId: user.id
+    });
+
+    return { changed: true };
   });
 }
