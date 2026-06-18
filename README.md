@@ -18,4 +18,4 @@ npm run dev
 
 Backend default address: `http://127.0.0.1:3000`
 
-Deployment details: [docs/backend-deployment.md](/F:/Projects/randomly_roll_background/docs/backend-deployment.md)
+中文部署教程：[docs/backend-deployment.md](docs/backend-deployment.md)
