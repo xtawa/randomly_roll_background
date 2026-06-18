@@ -12,17 +12,29 @@ type AuditInput = {
 };
 
 export async function writeAuditLog(prisma: PrismaClient, request: FastifyRequest | null, input: AuditInput) {
-  await prisma.auditLog.create({
-    data: {
-      actorUserId: request?.authUser?.userId,
-      actorEmail: request?.authUser?.email,
-      action: input.action,
-      entityType: input.entityType,
-      entityId: input.entityId ?? null,
-      requestId: request?.id ?? null,
-      beforeJson: input.before === undefined ? null : toJson(input.before),
-      afterJson: input.after === undefined ? null : toJson(input.after),
-      metadataJson: input.metadata === undefined ? null : toJson(input.metadata)
-    }
-  });
+  try {
+    await prisma.auditLog.create({
+      data: {
+        actorUserId: request?.authUser?.userId,
+        actorEmail: request?.authUser?.email,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId ?? null,
+        requestId: request?.id ?? null,
+        beforeJson: input.before === undefined ? null : toJson(input.before),
+        afterJson: input.after === undefined ? null : toJson(input.after),
+        metadataJson: input.metadata === undefined ? null : toJson(input.metadata)
+      }
+    });
+  } catch (error) {
+    request?.log.warn(
+      {
+        err: error,
+        action: input.action,
+        entityType: input.entityType,
+        entityId: input.entityId ?? null
+      },
+      "Audit log write failed."
+    );
+  }
 }

@@ -334,6 +334,7 @@ video {
 
 .hero-actions,
 .inline-actions,
+.inline-form,
 .switch-row,
 .capture-toolbar,
 .card-footer,
@@ -346,6 +347,15 @@ video {
 
 .hero-actions {
   margin-top: 24px;
+}
+
+.inline-form {
+  margin-top: 14px;
+  align-items: center;
+}
+
+.inline-form select {
+  flex: 1 1 220px;
 }
 
 .hero-side {

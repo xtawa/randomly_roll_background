@@ -131,6 +131,7 @@ async function buildPackagePayload(version: string) {
 export async function registerAdminRoutes(app: FastifyInstance) {
   const editorGuard = { preHandler: app.requireRole(["admin", "editor"]) };
   const adminGuard = { preHandler: app.requireRole(["admin"]) };
+  const packageVersionSchema = z.string().trim().optional().transform((value) => value || undefined);
 
   app.get("/api/admin/faces", editorGuard, async () => {
     const records = await prisma.faceProfile.findMany({
@@ -320,7 +321,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     const body = z.object({
       deviceCode: z.string().trim().min(8),
       classroom: z.string().trim().min(1),
-      packageVersion: z.string().trim().optional().transform((value) => value || undefined),
+      packageVersion: packageVersionSchema,
       devModeEnabled: z.boolean().default(false)
     }).parse(request.body);
 
@@ -373,6 +374,67 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       packageVersion: pairing.packageVersion,
       devModeEnabled: pairing.devModeEnabled,
       pairedAt: pairing.pairedAt.toISOString()
+    };
+  });
+
+  app.patch("/api/admin/devices/:deviceCode/package", editorGuard, async (request) => {
+    const deviceCode = z.string().trim().min(1).parse((request.params as { deviceCode: string }).deviceCode);
+    const body = z.object({
+      packageVersion: packageVersionSchema
+    }).parse(request.body);
+
+    if (body.packageVersion) {
+      const pkg = await prisma.facePackage.findUnique({ where: { version: body.packageVersion } });
+      if (!pkg) {
+        throw new HttpError(404, "PACKAGE_NOT_FOUND", "The requested package version does not exist.");
+      }
+    }
+
+    const device = await prisma.device.findUnique({
+      where: { deviceCode },
+      include: {
+        pairings: {
+          where: { isActive: true },
+          orderBy: { pairedAt: "desc" },
+          take: 1
+        }
+      }
+    });
+
+    if (!device || device.pairings.length === 0) {
+      throw new HttpError(404, "DEVICE_NOT_PAIRED", "The requested device is not currently paired.");
+    }
+
+    const activePairing = device.pairings[0];
+    const updated = await prisma.devicePairing.update({
+      where: { id: activePairing.id },
+      data: { packageVersion: body.packageVersion ?? null }
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "update_device_package",
+      entityType: "device",
+      entityId: deviceCode,
+      before: {
+        classroom: activePairing.classroom,
+        packageVersion: activePairing.packageVersion,
+        devModeEnabled: activePairing.devModeEnabled
+      },
+      after: {
+        classroom: updated.classroom,
+        packageVersion: updated.packageVersion,
+        devModeEnabled: updated.devModeEnabled
+      }
+    });
+
+    return {
+      updated: true,
+      deviceCode,
+      classroom: updated.classroom,
+      packageVersion: updated.packageVersion,
+      devModeEnabled: updated.devModeEnabled,
+      pairedAt: updated.pairedAt.toISOString(),
+      lastSeenAt: device.lastSeenAt?.toISOString() ?? null
     };
   });
 

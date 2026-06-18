@@ -46,21 +46,19 @@ npm --version
 
 `node --version` 应显示 `v22.x.x`。
 
-## 3. 放置项目和创建运行用户
+## 3. 确认项目目录和数据目录
 
-本教程假设项目位于 `/opt/randomly-roll`：
+本教程按照你的实际项目路径 `/home/pi/randomly_roll_background` 编写，并使用 `pi` 用户运行服务：
 
 ```bash
-sudo mkdir -p /opt/randomly-roll
 sudo mkdir -p /var/lib/randomly-roll/storage
-sudo useradd --system --home /var/lib/randomly-roll --shell /usr/sbin/nologin randomly-roll 2>/dev/null || true
-sudo chown -R randomly-roll:randomly-roll /opt/randomly-roll /var/lib/randomly-roll
+sudo chown -R pi:pi /home/pi/randomly_roll_background /var/lib/randomly-roll
 ```
 
-将仓库内容上传或克隆到 `/opt/randomly-roll` 后，目录应包含：
+确认目录结构：
 
 ```text
-/opt/randomly-roll/
+/home/pi/randomly_roll_background/
 ├── admin-console/
 ├── backend/
 └── docs/
@@ -69,13 +67,12 @@ sudo chown -R randomly-roll:randomly-roll /opt/randomly-roll /var/lib/randomly-r
 ## 4. 配置后端环境变量
 
 ```bash
-cd /opt/randomly-roll/backend
-sudo -u randomly-roll cp .env.example .env
-sudo chmod 600 .env
-sudo chown randomly-roll:randomly-roll .env
+cd /home/pi/randomly_roll_background/backend
+cp .env.example .env
+chmod 600 .env
 ```
 
-编辑 `/opt/randomly-roll/backend/.env`：
+编辑 `/home/pi/randomly_roll_background/backend/.env`：
 
 ```dotenv
 PORT=3000
@@ -105,18 +102,18 @@ openssl rand -hex 32
 ## 5. 构建并初始化后端
 
 ```bash
-cd /opt/randomly-roll/backend
-sudo -u randomly-roll npm ci
-sudo -u randomly-roll npm run db:generate
-sudo -u randomly-roll npm run db:push
-sudo -u randomly-roll npm run db:seed
-sudo -u randomly-roll npm run build
+cd /home/pi/randomly_roll_background/backend
+npm ci
+npm run db:generate
+npm run db:push
+npm run db:seed
+npm run build
 ```
 
 临时启动并检查：
 
 ```bash
-sudo -u randomly-roll node dist/server.js
+node dist/server.js
 ```
 
 打开另一个终端执行：
@@ -138,18 +135,18 @@ After=network.target
 
 [Service]
 Type=simple
-User=randomly-roll
-Group=randomly-roll
-WorkingDirectory=/opt/randomly-roll/backend
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/randomly_roll_background/backend
 Environment=NODE_ENV=production
-EnvironmentFile=/opt/randomly-roll/backend/.env
-ExecStart=/usr/bin/node /opt/randomly-roll/backend/dist/server.js
+EnvironmentFile=/home/pi/randomly_roll_background/backend/.env
+ExecStart=/usr/bin/node /home/pi/randomly_roll_background/backend/dist/server.js
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 ReadWritePaths=/var/lib/randomly-roll
 
 [Install]
@@ -173,9 +170,9 @@ sudo journalctl -u randomly-roll -f
 ## 7. 构建管理前端
 
 ```bash
-cd /opt/randomly-roll/admin-console
-sudo -u randomly-roll npm ci
-sudo -u randomly-roll npm run build
+cd /home/pi/randomly_roll_background/admin-console
+npm ci
+npm run build
 sudo mkdir -p /var/www/randomly-roll-admin
 sudo cp -a dist/. /var/www/randomly-roll-admin/
 sudo chown -R www-data:www-data /var/www/randomly-roll-admin
@@ -194,7 +191,7 @@ https://roll.example.com
 仓库已提供单域名配置模板：
 
 ```bash
-sudo cp /opt/randomly-roll/backend/deploy/nginx.randomly-roll.conf /etc/nginx/sites-available/randomly-roll
+sudo cp /home/pi/randomly_roll_background/backend/deploy/nginx.randomly-roll.conf /etc/nginx/sites-available/randomly-roll
 sudo sed -i 's/roll\.example\.com/你的真实域名/g' /etc/nginx/sites-available/randomly-roll
 sudo ln -s /etc/nginx/sites-available/randomly-roll /etc/nginx/sites-enabled/randomly-roll
 sudo rm -f /etc/nginx/sites-enabled/default
@@ -250,16 +247,16 @@ sudo ufw status
 更新代码后执行：
 
 ```bash
-cd /opt/randomly-roll/backend
-sudo -u randomly-roll npm ci
-sudo -u randomly-roll npm run db:generate
-sudo -u randomly-roll npm run db:push
-sudo -u randomly-roll npm run build
+cd /home/pi/randomly_roll_background/backend
+npm ci
+npm run db:generate
+npm run db:push
+npm run build
 sudo systemctl restart randomly-roll
 
-cd /opt/randomly-roll/admin-console
-sudo -u randomly-roll npm ci
-sudo -u randomly-roll npm run build
+cd /home/pi/randomly_roll_background/admin-console
+npm ci
+npm run build
 sudo cp -a dist/. /var/www/randomly-roll-admin/
 sudo chown -R www-data:www-data /var/www/randomly-roll-admin
 sudo systemctl reload nginx
@@ -287,7 +284,7 @@ sudo tar -czf /var/backups/randomly-roll-$(date +%F-%H%M).tar.gz /var/lib/random
 sudo systemctl start randomly-roll
 ```
 
-恢复时先停止服务，解压备份并确认目录所有者为 `randomly-roll:randomly-roll`，然后重新启动服务。
+恢复时先停止服务，解压备份并确认目录所有者为 `pi:pi`，然后重新启动服务。
 
 ## 13. 常见问题
 
@@ -317,7 +314,7 @@ client_max_body_size 20m;
 ### 数据库无写入权限
 
 ```bash
-sudo chown -R randomly-roll:randomly-roll /var/lib/randomly-roll
+sudo chown -R pi:pi /var/lib/randomly-roll
 sudo systemctl restart randomly-roll
 ```
 

@@ -17,9 +17,28 @@ const LOCAL_KEYS = {
 
 const app = document.getElementById("app");
 
+function getDefaultApiBaseUrl() {
+  if (typeof window !== "undefined" && /^https?:$/i.test(window.location.protocol)) {
+    return window.location.origin;
+  }
+
+  return "http://127.0.0.1:3000";
+}
+
+function resolveInitialApiBaseUrl() {
+  const savedValue = window.localStorage.getItem(LOCAL_KEYS.apiBaseUrl);
+  const normalizedSavedValue = String(savedValue || "").trim().replace(/\/+$/, "");
+
+  if (!normalizedSavedValue || normalizedSavedValue === "https://roll.underflo.ink") {
+    return normalizeApiBaseUrl(getDefaultApiBaseUrl());
+  }
+
+  return normalizeApiBaseUrl(normalizedSavedValue);
+}
+
 const state = {
   activeView: "enroll",
-  apiBaseUrl: normalizeApiBaseUrl(window.localStorage.getItem(LOCAL_KEYS.apiBaseUrl) || "https://roll.underflo.ink"),
+  apiBaseUrl: resolveInitialApiBaseUrl(),
   authToken: window.localStorage.getItem(LOCAL_KEYS.token) || "",
   sessionEmail: window.localStorage.getItem(LOCAL_KEYS.email) || "",
   account: null,
@@ -65,7 +84,7 @@ function escapeHtml(value) {
 }
 
 function normalizeApiBaseUrl(value) {
-  const rawValue = String(value || "").trim() || "https://roll.underflo.ink";
+  const rawValue = String(value || "").trim() || getDefaultApiBaseUrl();
   const withProtocol = /^https?:\/\//i.test(rawValue) ? rawValue : `https://${rawValue}`;
   return withProtocol.replace(/\/+$/, "");
 }
@@ -198,7 +217,7 @@ function normalizeDeviceRecord(item) {
   return {
     deviceCode: item.deviceCode,
     classroom: item.classroom || "未命名教室",
-    packageVersion: item.packageVersion || "未绑定",
+    packageVersion: item.packageVersion || "",
     devModeEnabled: Boolean(item.devModeEnabled),
     pairedAt: item.pairedAt || new Date().toISOString(),
     lastSeenAt: item.lastSeenAt || null
@@ -214,6 +233,17 @@ function normalizePackageRecord(item) {
     publishedAt: item.publishedAt || new Date().toISOString(),
     operator: item.operator || state.sessionEmail || "operator@example.com"
   };
+}
+
+function renderPackageOptions(selectedVersion = "", emptyLabel = "暂不指定版本") {
+  return `
+    <option value="">${escapeHtml(emptyLabel)}</option>
+    ${state.packages.map((pkg) => `
+      <option value="${escapeHtml(pkg.version)}" ${pkg.version === selectedVersion ? "selected" : ""}>
+        ${escapeHtml(pkg.version)}${pkg.isActive ? "（当前）" : ""}
+      </option>
+    `).join("")}
+  `;
 }
 
 async function refreshFaces() {
@@ -722,40 +752,99 @@ async function handleDeviceSubmit(event) {
   const packageVersion = String(formData.get("packageVersion") || "").trim();
   const devModeEnabled = formData.get("devModeEnabled") === "on";
 
-  if (!deviceCode || !classroom || !packageVersion) {
-    setStatus("请填写完整的设备信息。", "error");
+  if (!deviceCode || !classroom) {
+    setStatus("请填写完整的设备码和教室信息。", "error");
     return;
   }
 
   setLoading(true);
 
   try {
+    const payloadBody = {
+      deviceCode,
+      classroom,
+      devModeEnabled
+    };
+
+    if (packageVersion) {
+      payloadBody.packageVersion = packageVersion;
+    }
+
     const payload = await requestApi("/api/admin/devices/pair", {
       method: "POST",
-      body: {
-        deviceCode,
-        classroom,
-        packageVersion,
-        devModeEnabled
-      }
+      body: payloadBody
     });
 
     upsertLocalDevice(payload);
     state.loading = false;
-    setStatus(`设备 ${deviceCode} 已绑定到 ${classroom}。`, "success");
+    setStatus(
+      payload.packageVersion
+        ? `设备 ${deviceCode} 已绑定到 ${classroom}，版本 ${payload.packageVersion} 已生效。`
+        : `设备 ${deviceCode} 已绑定到 ${classroom}，暂未指定版本。`,
+      "success"
+    );
     await refreshDevices();
     render();
   } catch (error) {
-    upsertLocalDevice({
-      deviceCode,
-      classroom,
-      packageVersion,
-      devModeEnabled,
-      pairedAt: new Date().toISOString()
+    state.loading = false;
+    if (error.code === "PACKAGE_NOT_FOUND") {
+      setStatus("所选版本不存在。请先发布版本，或先留空绑定设备。", "error");
+      return;
+    }
+
+    setStatus(`设备绑定失败：${error.message}`, "error");
+  }
+}
+
+async function handleDeviceVersionSwitch(event) {
+  event.preventDefault();
+
+  const formData = new FormData(event.currentTarget);
+  const deviceCode = String(formData.get("deviceCode") || "").trim();
+  const packageVersion = String(formData.get("packageVersion") || "").trim();
+
+  if (!deviceCode) {
+    setStatus("未找到要更新的设备。", "error");
+    return;
+  }
+
+  setLoading(true);
+
+  try {
+    const payloadBody = {};
+    if (packageVersion) {
+      payloadBody.packageVersion = packageVersion;
+    }
+
+    const payload = await requestApi(`/api/admin/devices/${encodeURIComponent(deviceCode)}/package`, {
+      method: "PATCH",
+      body: payloadBody
     });
 
+    upsertLocalDevice(payload);
     state.loading = false;
-    setStatus(`设备信息已写入本地预览：${error.message}`, "error");
+    setStatus(
+      packageVersion
+        ? `设备 ${deviceCode} 已切换到版本 ${packageVersion}。`
+        : `设备 ${deviceCode} 已清除指定版本。`,
+      "success"
+    );
+    await refreshDevices();
+    render();
+  } catch (error) {
+    state.loading = false;
+
+    if (error.code === "PACKAGE_NOT_FOUND") {
+      setStatus("所选版本不存在，请先发布该版本。", "error");
+      return;
+    }
+
+    if (error.code === "DEVICE_NOT_PAIRED") {
+      setStatus("该设备还没有绑定教室，先完成设备绑定。", "error");
+      return;
+    }
+
+    setStatus(`版本切换失败：${error.message}`, "error");
   }
 }
 
@@ -1225,8 +1314,6 @@ function renderRoster() {
 }
 
 function renderDevices() {
-  const activePackage = state.packages.find((item) => item.isActive) || state.packages[0];
-
   return `
     <section class="panel panel-split">
       <form class="form-panel" data-device-form>
@@ -1245,13 +1332,12 @@ function renderDevices() {
             <span>教室或班级</span>
             <input name="classroom" type="text" placeholder="例如：Room 301 / 一年级一班" required />
           </label>
-          <label class="field">
-            <span>使用版本</span>
-            <input name="packageVersion" type="text" value="${escapeHtml(activePackage?.version || "")}" placeholder="例如：2026.06.18.2" required />
-          </label>
           <div class="switch-row">
             <label><input name="devModeEnabled" type="checkbox" /> 调试可视化</label>
           </div>
+        </div>
+        <div class="notice-card">
+          这里先完成设备与教室的绑定。版本切换在右侧设备卡片里单独处理，不需要重新绑定。
         </div>
         <div class="inline-actions">
           <button class="primary-button" type="submit">保存设备</button>
@@ -1273,9 +1359,16 @@ function renderDevices() {
                 <span class="device-state ${device.devModeEnabled ? "accent" : ""}">${device.devModeEnabled ? "调试开" : "正常模式"}</span>
               </div>
               <p class="mono">${escapeHtml(device.deviceCode)}</p>
-              <div class="device-meta">版本：${escapeHtml(device.packageVersion)}</div>
+              <div class="device-meta">当前版本：${escapeHtml(device.packageVersion || "未指定")}</div>
               <div class="device-meta">绑定时间：${escapeHtml(formatDate(device.pairedAt))}</div>
               <div class="device-meta">最近同步：${escapeHtml(formatDate(device.lastSeenAt))}</div>
+              <form class="inline-form" data-device-version-form>
+                <input name="deviceCode" type="hidden" value="${escapeHtml(device.deviceCode)}" />
+                <select name="packageVersion">
+                  ${renderPackageOptions(device.packageVersion, "清除指定版本")}
+                </select>
+                <button class="ghost-button compact" type="submit">切换版本</button>
+              </form>
             </article>
           `).join("") || `<div class="empty-card">还没有绑定任何设备，等录入完成并发布版本后再来这里绑定。</div>`}
         </div>
@@ -1404,7 +1497,7 @@ function renderSettings() {
         <div class="form-grid">
           <label class="field field-wide">
             <span>API 地址</span>
-            <input name="apiBaseUrl" type="text" value="${escapeHtml(state.apiBaseUrl)}" placeholder="https://roll.underflo.ink" />
+            <input name="apiBaseUrl" type="text" value="${escapeHtml(state.apiBaseUrl)}" placeholder="${escapeHtml(getDefaultApiBaseUrl())}" />
           </label>
         </div>
         <div class="inline-actions">
@@ -1518,6 +1611,9 @@ function bindEvents() {
 
   document.querySelector("[data-enroll-form]")?.addEventListener("submit", handleEnrollSubmit);
   document.querySelector("[data-device-form]")?.addEventListener("submit", handleDeviceSubmit);
+  document.querySelectorAll("[data-device-version-form]").forEach((form) => {
+    form.addEventListener("submit", handleDeviceVersionSwitch);
+  });
   document.querySelector("[data-publish-form]")?.addEventListener("submit", handlePublishSubmit);
   document.querySelector("[data-rollback-form]")?.addEventListener("submit", handleRollbackSubmit);
 
