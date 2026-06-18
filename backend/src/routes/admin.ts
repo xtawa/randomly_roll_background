@@ -1,0 +1,513 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import type { MultipartFile } from "@fastify/multipart";
+import type { FastifyInstance } from "fastify";
+import { z } from "zod";
+import { config } from "../config.js";
+import { prisma } from "../db.js";
+import { writeAuditLog } from "../lib/audit.js";
+import { buildDescriptor } from "../lib/descriptors.js";
+import { HttpError } from "../lib/http-error.js";
+import { parseJson, toJson } from "../lib/json.js";
+
+const faceSchema = z.object({
+  personId: z.string().trim().min(1),
+  displayName: z.string().trim().min(1),
+  preferred: z.boolean().default(false),
+  ignored: z.boolean().default(false),
+  baseWeight: z.coerce.number().int().min(1).max(10).default(1),
+  tags: z.array(z.string().trim().min(1)).default([])
+});
+
+const faceUpdateSchema = faceSchema.omit({ personId: true }).partial().extend({
+  baseWeight: z.coerce.number().int().min(1).max(10).optional(),
+  tags: z.array(z.string().trim().min(1)).optional()
+});
+
+async function saveUploadedFile(personId: string, file: MultipartFile) {
+  const ext = path.extname(file.filename || "");
+  const directory = path.join(config.storageDir, "uploads", personId);
+  await fs.mkdir(directory, { recursive: true });
+
+  const buffer = await file.toBuffer();
+  const storedFileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${ext}`;
+  const storedPath = path.join(directory, storedFileName);
+
+  await fs.writeFile(storedPath, buffer);
+
+  return {
+    buffer,
+    storedFileName,
+    storedPath
+  };
+}
+
+async function buildSampleEntries(requestBody: unknown, faceId: string, files: MultipartFile[]) {
+  if (files.length > 0) {
+    const notes = typeof (requestBody as Record<string, unknown> | undefined)?.notes === "string"
+      ? String((requestBody as Record<string, unknown>).notes)
+      : "";
+
+    return Promise.all(files.map(async (file) => {
+      const saved = await saveUploadedFile(faceId, file);
+      return {
+        notes,
+        originalFileName: file.filename,
+        storedFileName: saved.storedFileName,
+        mimeType: file.mimetype,
+        sizeBytes: saved.buffer.byteLength,
+        qualityScore: 0.9,
+        descriptor: buildDescriptor(saved.buffer)
+      };
+    }));
+  }
+
+  const body = z.object({
+    notes: z.string().optional().default(""),
+    fileNames: z.array(z.string().trim().min(1)).min(1),
+    descriptors: z.array(z.array(z.number())).optional()
+  }).parse(requestBody);
+
+  return body.fileNames.map((fileName, index) => ({
+    notes: body.notes,
+    originalFileName: fileName,
+    storedFileName: null,
+    mimeType: "application/octet-stream",
+    sizeBytes: null,
+    qualityScore: 0.75,
+    descriptor: body.descriptors?.[index] || buildDescriptor(`${faceId}:${fileName}:${index}`)
+  }));
+}
+
+async function parseMultipartFiles(request: Parameters<FastifyInstance["post"]>[1] extends never ? never : any): Promise<MultipartFile[]> {
+  if (!request.isMultipart()) {
+    return [];
+  }
+
+  const files: MultipartFile[] = [];
+  const parts = request.parts();
+  for await (const part of parts) {
+    if (part.type === "file") {
+      files.push(part);
+    } else {
+      request.body = {
+        ...(typeof request.body === "object" && request.body ? request.body : {}),
+        [part.fieldname]: part.value
+      };
+    }
+  }
+  return files;
+}
+
+async function buildPackagePayload(version: string) {
+  const faceProfiles = await prisma.faceProfile.findMany({
+    where: { isActive: true },
+    orderBy: { personId: "asc" },
+    include: {
+      descriptors: {
+        orderBy: { createdAt: "desc" },
+        take: 5
+      }
+    }
+  });
+
+  return {
+    version,
+    publishedAt: new Date().toISOString(),
+    thresholdDefault: 0.52,
+    people: faceProfiles.map((profile) => ({
+      personId: profile.personId,
+      displayName: profile.displayName,
+      descriptors: profile.descriptors.map((item) => parseJson<number[]>(item.vectorJson, [])),
+      preferred: profile.preferred,
+      ignored: profile.ignored,
+      baseWeight: profile.baseWeight,
+      tags: parseJson<string[]>(profile.tagsJson, []),
+      updatedAt: profile.updatedAt.toISOString()
+    }))
+  };
+}
+
+export async function registerAdminRoutes(app: FastifyInstance) {
+  const editorGuard = { preHandler: app.requireRole(["admin", "editor"]) };
+  const adminGuard = { preHandler: app.requireRole(["admin"]) };
+
+  app.get("/api/admin/faces", editorGuard, async () => {
+    const records = await prisma.faceProfile.findMany({
+      orderBy: { updatedAt: "desc" },
+      include: {
+        descriptors: true,
+        samples: true
+      }
+    });
+
+    return {
+      items: records.map((record) => ({
+        personId: record.personId,
+        displayName: record.displayName,
+        preferred: record.preferred,
+        ignored: record.ignored,
+        baseWeight: record.baseWeight,
+        tags: parseJson<string[]>(record.tagsJson, []),
+        descriptorCount: record.descriptors.length,
+        sampleCount: record.samples.length,
+        updatedAt: record.updatedAt.toISOString()
+      }))
+    };
+  });
+
+  app.post("/api/admin/faces", editorGuard, async (request, reply) => {
+    const body = faceSchema.parse(request.body);
+    const existing = await prisma.faceProfile.findUnique({ where: { personId: body.personId } });
+    if (existing) {
+      throw new HttpError(409, "FACE_PROFILE_EXISTS", "A face profile with this personId already exists.");
+    }
+
+    const created = await prisma.faceProfile.create({
+      data: {
+        personId: body.personId,
+        displayName: body.displayName,
+        preferred: body.preferred,
+        ignored: body.ignored,
+        baseWeight: body.baseWeight,
+        tagsJson: toJson(body.tags)
+      }
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "create_face_profile",
+      entityType: "face_profile",
+      entityId: created.personId,
+      after: body
+    });
+
+    reply.code(201).send({
+      personId: created.personId,
+      displayName: created.displayName
+    });
+  });
+
+  app.patch("/api/admin/faces/:id", editorGuard, async (request) => {
+    const personId = z.string().trim().min(1).parse((request.params as { id: string }).id);
+    const body = faceUpdateSchema.parse(request.body);
+    const existing = await prisma.faceProfile.findUnique({ where: { personId } });
+    if (!existing) {
+      throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
+    }
+
+    const updated = await prisma.faceProfile.update({
+      where: { personId },
+      data: {
+        displayName: body.displayName ?? existing.displayName,
+        preferred: body.preferred ?? existing.preferred,
+        ignored: body.ignored ?? existing.ignored,
+        baseWeight: body.baseWeight ?? existing.baseWeight,
+        tagsJson: body.tags ? toJson(body.tags) : existing.tagsJson
+      }
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "update_face_profile",
+      entityType: "face_profile",
+      entityId: personId,
+      before: {
+        displayName: existing.displayName,
+        preferred: existing.preferred,
+        ignored: existing.ignored,
+        baseWeight: existing.baseWeight,
+        tags: parseJson<string[]>(existing.tagsJson, [])
+      },
+      after: {
+        displayName: updated.displayName,
+        preferred: updated.preferred,
+        ignored: updated.ignored,
+        baseWeight: updated.baseWeight,
+        tags: parseJson<string[]>(updated.tagsJson, [])
+      }
+    });
+
+    return {
+      personId: updated.personId,
+      displayName: updated.displayName
+    };
+  });
+
+  app.post("/api/admin/faces/:id/samples", editorGuard, async (request, reply) => {
+    const faceId = z.string().trim().min(1).parse((request.params as { id: string }).id);
+    const profile = await prisma.faceProfile.findUnique({ where: { personId: faceId } });
+    if (!profile) {
+      throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
+    }
+
+    const files = await parseMultipartFiles(request);
+    const entries = await buildSampleEntries(request.body, faceId, files);
+
+    const created = await prisma.$transaction(async (tx) => {
+      const results = [];
+      for (const entry of entries) {
+        const sample = await tx.faceSample.create({
+          data: {
+            faceProfileId: profile.id,
+            notes: entry.notes,
+            originalFileName: entry.originalFileName,
+            storedFileName: entry.storedFileName,
+            mimeType: entry.mimeType,
+            sizeBytes: entry.sizeBytes,
+            status: "accepted",
+            qualityScore: entry.qualityScore
+          }
+        });
+
+        const descriptor = await tx.faceDescriptor.create({
+          data: {
+            faceProfileId: profile.id,
+            sampleId: sample.id,
+            source: entry.storedFileName ? "upload" : "declared",
+            vectorJson: toJson(entry.descriptor)
+          }
+        });
+
+        results.push({ sample, descriptor });
+      }
+      return results;
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "upload_face_samples",
+      entityType: "face_profile",
+      entityId: faceId,
+      metadata: {
+        sampleCount: created.length,
+        fileNames: created.map((item) => item.sample.originalFileName)
+      }
+    });
+
+    reply.code(201).send({
+      personId: faceId,
+      createdSamples: created.length,
+      descriptorCount: created.length
+    });
+  });
+
+  app.get("/api/admin/devices", editorGuard, async () => {
+    const devices = await prisma.device.findMany({
+      orderBy: { updatedAt: "desc" },
+      include: {
+        pairings: {
+          where: { isActive: true },
+          orderBy: { pairedAt: "desc" },
+          take: 1
+        }
+      }
+    });
+
+    return {
+      items: devices.map((device) => {
+        const pairing = device.pairings[0];
+        return {
+          deviceCode: device.deviceCode,
+          lastSeenAt: device.lastSeenAt?.toISOString() ?? null,
+          classroom: pairing?.classroom ?? null,
+          packageVersion: pairing?.packageVersion ?? null,
+          devModeEnabled: pairing?.devModeEnabled ?? false,
+          pairedAt: pairing?.pairedAt.toISOString() ?? null
+        };
+      })
+    };
+  });
+
+  app.post("/api/admin/devices/pair", editorGuard, async (request) => {
+    const body = z.object({
+      deviceCode: z.string().trim().min(8),
+      classroom: z.string().trim().min(1),
+      packageVersion: z.string().trim().optional().transform((value) => value || undefined),
+      devModeEnabled: z.boolean().default(false)
+    }).parse(request.body);
+
+    if (body.packageVersion) {
+      const pkg = await prisma.facePackage.findUnique({ where: { version: body.packageVersion } });
+      if (!pkg) {
+        throw new HttpError(404, "PACKAGE_NOT_FOUND", "The requested package version does not exist.");
+      }
+    }
+
+    const device = await prisma.device.upsert({
+      where: { deviceCode: body.deviceCode },
+      update: {},
+      create: { deviceCode: body.deviceCode }
+    });
+
+    await prisma.devicePairing.updateMany({
+      where: { deviceId: device.id, isActive: true },
+      data: {
+        isActive: false,
+        revokedAt: new Date()
+      }
+    });
+
+    const pairing = await prisma.devicePairing.create({
+      data: {
+        deviceId: device.id,
+        classroom: body.classroom,
+        packageVersion: body.packageVersion ?? null,
+        devModeEnabled: body.devModeEnabled,
+        pairedByUserId: request.authUser?.userId ?? null
+      }
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "pair_device",
+      entityType: "device",
+      entityId: body.deviceCode,
+      after: {
+        classroom: pairing.classroom,
+        packageVersion: pairing.packageVersion,
+        devModeEnabled: pairing.devModeEnabled
+      }
+    });
+
+    return {
+      paired: true,
+      deviceCode: body.deviceCode,
+      classroom: pairing.classroom,
+      packageVersion: pairing.packageVersion,
+      devModeEnabled: pairing.devModeEnabled,
+      pairedAt: pairing.pairedAt.toISOString()
+    };
+  });
+
+  app.get("/api/admin/packages", editorGuard, async () => {
+    const packages = await prisma.facePackage.findMany({
+      orderBy: { publishedAt: "desc" },
+      include: { packagePeople: true, publishedBy: true }
+    });
+
+    return {
+      items: packages.map((pkg) => ({
+        version: pkg.version,
+        isActive: pkg.isActive,
+        notes: pkg.notes,
+        peopleCount: pkg.packagePeople.length,
+        publishedAt: pkg.publishedAt.toISOString(),
+        operator: pkg.publishedBy?.email ?? null
+      }))
+    };
+  });
+
+  app.post("/api/admin/packages/publish", adminGuard, async (request, reply) => {
+    const body = z.object({
+      version: z.string().trim().min(1),
+      notes: z.string().trim().optional().default("")
+    }).parse(request.body);
+
+    const existing = await prisma.facePackage.findUnique({ where: { version: body.version } });
+    if (existing) {
+      throw new HttpError(409, "PUBLISH_CONFLICT", "This package version already exists.");
+    }
+
+    const payload = await buildPackagePayload(body.version);
+
+    const created = await prisma.$transaction(async (tx) => {
+      await tx.facePackage.updateMany({
+        where: { isActive: true },
+        data: { isActive: false }
+      });
+
+      const facePackage = await tx.facePackage.create({
+        data: {
+          version: body.version,
+          notes: body.notes,
+          payloadJson: toJson(payload),
+          isActive: true,
+          publishedById: request.authUser?.userId ?? null
+        }
+      });
+
+      if (payload.people.length > 0) {
+        await tx.packagePerson.createMany({
+          data: payload.people.map((person) => ({
+            facePackageId: facePackage.id,
+            personId: person.personId,
+            displayName: person.displayName,
+            preferred: person.preferred,
+            ignored: person.ignored,
+            baseWeight: person.baseWeight,
+            tagsJson: toJson(person.tags),
+            descriptorCount: person.descriptors.length,
+            updatedAt: new Date(person.updatedAt)
+          }))
+        });
+      }
+
+      return facePackage;
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "publish_package",
+      entityType: "face_package",
+      entityId: body.version,
+      after: {
+        version: body.version,
+        notes: body.notes,
+        peopleCount: payload.people.length
+      }
+    });
+
+    reply.code(201).send({
+      version: created.version,
+      publishedAt: created.publishedAt.toISOString(),
+      peopleCount: payload.people.length,
+      downloadUrl: new URL(`/api/client/packages/${encodeURIComponent(created.version)}`, config.PUBLIC_BASE_URL).toString()
+    });
+  });
+
+  app.post("/api/admin/packages/:version/rollback", adminGuard, async (request) => {
+    const version = z.string().trim().min(1).parse((request.params as { version: string }).version);
+    const target = await prisma.facePackage.findUnique({ where: { version } });
+    if (!target) {
+      throw new HttpError(404, "ROLLBACK_TARGET_INVALID", "The requested rollback version does not exist.");
+    }
+
+    await prisma.$transaction([
+      prisma.facePackage.updateMany({
+        where: { isActive: true },
+        data: { isActive: false }
+      }),
+      prisma.facePackage.update({
+        where: { version },
+        data: { isActive: true }
+      })
+    ]);
+
+    await writeAuditLog(prisma, request, {
+      action: "rollback_package",
+      entityType: "face_package",
+      entityId: version
+    });
+
+    return {
+      rolledBackTo: version
+    };
+  });
+
+  app.get("/api/admin/audit-logs", editorGuard, async () => {
+    const logs = await prisma.auditLog.findMany({
+      orderBy: { createdAt: "desc" },
+      take: 200
+    });
+
+    return {
+      items: logs.map((log) => ({
+        when: log.createdAt.toISOString(),
+        actor: log.actorEmail,
+        action: log.action,
+        entityType: log.entityType,
+        entityId: log.entityId,
+        requestId: log.requestId,
+        before: parseJson(log.beforeJson, null),
+        after: parseJson(log.afterJson, null),
+        metadata: parseJson(log.metadataJson, null)
+      }))
+    };
+  });
+}

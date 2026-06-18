@@ -1,0 +1,152 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                String              @id @default(cuid())
+  email             String              @unique
+  passwordHash      String
+  role              String              @default("editor")
+  emailVerified     Boolean             @default(false)
+  emailVerifiedAt   DateTime?
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+  emailVerifications EmailVerification[]
+  passwordResets    PasswordReset[]
+  auditLogs         AuditLog[]
+  pairedDevices     DevicePairing[]
+  publishedPackages FacePackage[]
+}
+
+model EmailVerification {
+  id         String    @id @default(cuid())
+  email      String
+  code       String
+  expiresAt  DateTime
+  verifiedAt DateTime?
+  createdAt  DateTime  @default(now())
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PasswordReset {
+  id        String   @id @default(cuid())
+  email     String
+  token     String
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model Device {
+  id          String          @id @default(cuid())
+  deviceCode  String          @unique
+  lastSeenAt  DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  pairings    DevicePairing[]
+}
+
+model DevicePairing {
+  id              String   @id @default(cuid())
+  classroom       String
+  packageVersion  String?
+  devModeEnabled  Boolean  @default(false)
+  isActive        Boolean  @default(true)
+  pairedAt        DateTime @default(now())
+  revokedAt       DateTime?
+  deviceId        String
+  device          Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  pairedByUserId  String?
+  pairedByUser    User?    @relation(fields: [pairedByUserId], references: [id], onDelete: SetNull)
+}
+
+model FaceProfile {
+  id          String           @id @default(cuid())
+  personId    String           @unique
+  displayName String
+  preferred   Boolean          @default(false)
+  ignored     Boolean          @default(false)
+  baseWeight  Int              @default(1)
+  tagsJson    String           @default("[]")
+  isActive    Boolean          @default(true)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  samples     FaceSample[]
+  descriptors FaceDescriptor[]
+}
+
+model FaceSample {
+  id               String   @id @default(cuid())
+  notes            String?
+  originalFileName String
+  storedFileName   String?
+  mimeType         String?
+  sizeBytes        Int?
+  status           String   @default("accepted")
+  qualityScore     Float?
+  rejectionReason  String?
+  createdAt        DateTime @default(now())
+  faceProfileId    String
+  faceProfile      FaceProfile @relation(fields: [faceProfileId], references: [id], onDelete: Cascade)
+  descriptors      FaceDescriptor[]
+}
+
+model FaceDescriptor {
+  id            String   @id @default(cuid())
+  vectorJson    String
+  source        String   @default("sample")
+  createdAt     DateTime @default(now())
+  faceProfileId String
+  faceProfile   FaceProfile @relation(fields: [faceProfileId], references: [id], onDelete: Cascade)
+  sampleId      String?
+  sample        FaceSample? @relation(fields: [sampleId], references: [id], onDelete: SetNull)
+}
+
+model FacePackage {
+  id             String   @id @default(cuid())
+  version        String   @unique
+  notes          String?
+  payloadJson    String
+  isActive       Boolean  @default(false)
+  publishedAt    DateTime @default(now())
+  publishedById  String?
+  publishedBy    User?    @relation(fields: [publishedById], references: [id], onDelete: SetNull)
+  packagePeople  PackagePerson[]
+}
+
+model PackagePerson {
+  id            String   @id @default(cuid())
+  personId      String
+  displayName   String
+  preferred     Boolean
+  ignored       Boolean
+  baseWeight    Int
+  tagsJson      String
+  descriptorCount Int
+  updatedAt     DateTime
+  facePackageId String
+  facePackage   FacePackage @relation(fields: [facePackageId], references: [id], onDelete: Cascade)
+}
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorEmail   String?
+  action       String
+  entityType   String
+  entityId     String?
+  requestId    String?
+  beforeJson   String?
+  afterJson    String?
+  metadataJson String?
+  createdAt    DateTime @default(now())
+  actorUserId  String?
+  actorUser    User?    @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+}

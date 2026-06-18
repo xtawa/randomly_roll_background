@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+backend/node_modules/
+backend/dist/
+backend/dev.db
+backend/dev.db-journal
+backend/prisma/dev.db
+backend/prisma/dev.db-journal
+backend/storage/
+admin-console/node_modules/
