@@ -22,12 +22,10 @@ model User {
   auditLogs         AuditLog[]
   pairedDevices     DevicePairing[]
   publishedPackages FacePackage[]
-  groupId           String?
-  group             AccountGroup?       @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  groupMemberships  AccountGroupMember[]
   faceProfiles      FaceProfile[]
 
   @@index([registrationIp])
-  @@index([groupId])
 }
 
 model AccountGroup {
@@ -36,9 +34,22 @@ model AccountGroup {
   description String?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
-  members     User[]
+  memberships AccountGroupMember[]
   devices     Device[]
   packages    FacePackage[]
+}
+
+model AccountGroupMember {
+  id        String       @id @default(cuid())
+  createdAt DateTime     @default(now())
+  groupId   String
+  userId    String
+  group     AccountGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user      User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([groupId])
+  @@index([userId])
 }
 
 model EmailVerification {
@@ -71,7 +82,7 @@ model Device {
   updatedAt   DateTime        @updatedAt
   pairings    DevicePairing[]
   groupId     String?
-  group       AccountGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  group       AccountGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
   @@index([groupId])
 }

@@ -727,6 +727,50 @@ video {
   gap: 16px;
 }
 
+.device-scan-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.device-scan-stage {
+  position: relative;
+  min-height: 260px;
+  overflow: hidden;
+  border: 1px solid rgba(80, 53, 27, 0.12);
+  border-radius: 22px;
+  background:
+    linear-gradient(180deg, rgba(34, 29, 24, 0.72), rgba(25, 21, 18, 0.92)),
+    #1b1510;
+}
+
+.device-scanner-preview {
+  width: 100%;
+  min-height: 260px;
+  object-fit: cover;
+  background: #1c1712;
+}
+
+.scan-placeholder {
+  display: grid;
+  place-items: center;
+  min-height: 260px;
+  padding: 24px;
+  color: #f6efe7;
+  text-align: center;
+}
+
+.scan-placeholder strong {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 1.05rem;
+}
+
+.scan-placeholder p {
+  margin: 0;
+  color: rgba(246, 239, 231, 0.82);
+  line-height: 1.7;
+}
+
 .camera-stage {
   position: relative;
   min-height: 420px;
@@ -759,6 +803,11 @@ video {
   border: 2px solid rgba(255, 235, 214, 0.86);
   border-radius: 26px;
   box-shadow: inset 0 0 0 1px rgba(184, 93, 40, 0.28);
+}
+
+.scan-frame-wide {
+  width: min(82%, 480px);
+  aspect-ratio: 1.5;
 }
 
 .scan-line {
@@ -1097,7 +1146,10 @@ select:focus {
   }
 
   .camera-stage,
-  .camera-preview {
+  .camera-preview,
+  .device-scan-stage,
+  .device-scanner-preview,
+  .scan-placeholder {
     min-height: 320px;
   }
 

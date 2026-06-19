@@ -110,7 +110,13 @@ async function buildPackagePayload(version: string, groupId: string) {
   const faceProfiles = await prisma.faceProfile.findMany({
     where: {
       isActive: true,
-      ownerUser: { groupId }
+      ownerUser: {
+        is: {
+          groupMemberships: {
+            some: { groupId }
+          }
+        }
+      }
     },
     orderBy: { personId: "asc" },
     include: {
@@ -151,7 +157,18 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       include: {
         descriptors: true,
         samples: true,
-        ownerUser: { select: { email: true, groupId: true } }
+        ownerUser: {
+          select: {
+            email: true,
+            groupMemberships: {
+              include: {
+                group: {
+                  select: { id: true, name: true }
+                }
+              }
+            }
+          }
+        }
       }
     });
 
@@ -166,7 +183,10 @@ export async function registerAdminRoutes(app: FastifyInstance) {
         descriptorCount: record.descriptors.length,
         sampleCount: record.samples.length,
         ownerEmail: record.ownerUser?.email ?? null,
-        groupId: record.ownerUser?.groupId ?? null,
+        groupId: record.ownerUser?.groupMemberships[0]?.groupId ?? null,
+        groups: (record.ownerUser?.groupMemberships || [])
+          .map((membership) => membership.group)
+          .sort((left, right) => left.name.localeCompare(right.name, "zh-CN")),
         updatedAt: record.updatedAt.toISOString()
       }))
     };
@@ -361,12 +381,19 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       ? null
       : await prisma.user.findUnique({
         where: { id: request.authUser!.userId },
-        select: { groupId: true }
+        select: {
+          groupMemberships: {
+            select: { groupId: true }
+          }
+        }
       });
+    const groupIds = currentUser?.groupMemberships.map((membership) => membership.groupId) || [];
     const devices = await prisma.device.findMany({
       where: request.authUser?.role === "admin"
         ? undefined
-        : { groupId: currentUser?.groupId || "__unassigned__" },
+        : groupIds.length > 0
+          ? { groupId: { in: groupIds } }
+          : { groupId: "__unassigned__" },
       orderBy: { updatedAt: "desc" },
       include: {
         pairings: {

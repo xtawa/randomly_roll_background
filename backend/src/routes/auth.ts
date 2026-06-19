@@ -147,7 +147,13 @@ export async function registerAuthRoutes(app: FastifyInstance) {
         id: true,
         email: true,
         role: true,
-        group: { select: { id: true, name: true } },
+        groupMemberships: {
+          include: {
+            group: {
+              select: { id: true, name: true }
+            }
+          }
+        },
         emailVerified: true,
         createdAt: true,
         updatedAt: true
@@ -158,11 +164,16 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       throw new HttpError(404, "AUTH_USER_NOT_FOUND", "The current account no longer exists.");
     }
 
+    const groups = user.groupMemberships
+      .map((membership) => membership.group)
+      .sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
+
     return {
       userId: user.id,
       email: user.email,
       role: user.role,
-      group: user.group,
+      group: groups[0] ?? null,
+      groups,
       emailVerified: user.emailVerified,
       createdAt: user.createdAt.toISOString(),
       updatedAt: user.updatedAt.toISOString()

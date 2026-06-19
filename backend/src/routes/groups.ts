@@ -22,9 +22,12 @@ export async function registerGroupRoutes(app: FastifyInstance) {
       prisma.accountGroup.findMany({
         orderBy: { name: "asc" },
         include: {
-          members: {
-            orderBy: { email: "asc" },
-            select: { id: true, email: true, role: true }
+          memberships: {
+            include: {
+              user: {
+                select: { id: true, email: true, role: true }
+              }
+            }
           },
           devices: {
             orderBy: { deviceCode: "asc" },
@@ -39,9 +42,15 @@ export async function registerGroupRoutes(app: FastifyInstance) {
         }
       }),
       prisma.user.findMany({
-        where: { role: { not: "admin" } },
         orderBy: { email: "asc" },
-        select: { id: true, email: true, role: true, groupId: true }
+        select: {
+          id: true,
+          email: true,
+          role: true,
+          groupMemberships: {
+            select: { groupId: true }
+          }
+        }
       }),
       prisma.device.findMany({
         orderBy: { deviceCode: "asc" },
@@ -67,17 +76,25 @@ export async function registerGroupRoutes(app: FastifyInstance) {
         id: group.id,
         name: group.name,
         description: group.description || "",
-        members: group.members.map((member) => ({
-          ...member,
-          faceCount: countByOwner.get(member.id) || 0
-        })),
+        members: group.memberships
+          .map((membership) => membership.user)
+          .sort((left, right) => left.email.localeCompare(right.email, "zh-CN"))
+          .map((member) => ({
+            ...member,
+            faceCount: countByOwner.get(member.id) || 0
+          })),
         devices: group.devices.map((device) => ({
           deviceCode: device.deviceCode,
           classroom: device.pairings[0]?.classroom ?? null
         })),
         updatedAt: group.updatedAt.toISOString()
       })),
-      users,
+      users: users.map((user) => ({
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        groupIds: user.groupMemberships.map((membership) => membership.groupId)
+      })),
       devices: devices.map((device) => ({
         deviceCode: device.deviceCode,
         groupId: device.groupId,
@@ -109,6 +126,8 @@ export async function registerGroupRoutes(app: FastifyInstance) {
   app.put("/api/admin/groups/:id", adminGuard, async (request) => {
     const groupId = z.string().trim().min(1).parse((request.params as { id: string }).id);
     const body = groupAssignmentSchema.parse(request.body);
+    const memberIds = [...new Set(body.memberIds)];
+    const deviceCodes = [...new Set(body.deviceCodes)];
     const existing = await prisma.accountGroup.findUnique({ where: { id: groupId } });
     if (!existing) {
       throw new HttpError(404, "GROUP_NOT_FOUND", "The requested account group does not exist.");
@@ -120,33 +139,55 @@ export async function registerGroupRoutes(app: FastifyInstance) {
       throw new HttpError(409, "GROUP_NAME_EXISTS", "An account group with this name already exists.");
     }
 
-    const [memberCount, deviceCount] = await Promise.all([
-      prisma.user.count({ where: { id: { in: body.memberIds }, role: { not: "admin" } } }),
-      prisma.device.count({ where: { deviceCode: { in: body.deviceCodes } } })
+    const [selectedUsers, deviceCount] = await Promise.all([
+      prisma.user.findMany({
+        where: { id: { in: memberIds } },
+        select: { id: true, role: true }
+      }),
+      prisma.device.count({ where: { deviceCode: { in: deviceCodes } } })
     ]);
-    if (memberCount !== new Set(body.memberIds).size) {
+    if (selectedUsers.length !== memberIds.length) {
       throw new HttpError(400, "GROUP_MEMBERS_INVALID", "One or more selected member accounts are invalid.");
     }
-    if (deviceCount !== new Set(body.deviceCodes).size) {
+    if (deviceCount !== deviceCodes.length) {
       throw new HttpError(400, "GROUP_DEVICES_INVALID", "One or more selected devices are invalid.");
     }
 
-    await prisma.$transaction([
-      prisma.accountGroup.update({
+    const nonAdminIds = selectedUsers
+      .filter((user) => user.role !== "admin")
+      .map((user) => user.id);
+
+    await prisma.$transaction(async (tx) => {
+      await tx.accountGroup.update({
         where: { id: groupId },
         data: { name: body.name, description: body.description || null }
-      }),
-      prisma.user.updateMany({ where: { groupId }, data: { groupId: null } }),
-      prisma.device.updateMany({ where: { groupId }, data: { groupId: null } }),
-      prisma.user.updateMany({
-        where: { id: { in: body.memberIds }, role: { not: "admin" } },
-        data: { groupId }
-      }),
-      prisma.device.updateMany({
-        where: { deviceCode: { in: body.deviceCodes } },
-        data: { groupId }
-      })
-    ]);
+      });
+      await tx.accountGroupMember.deleteMany({ where: { groupId } });
+
+      if (nonAdminIds.length > 0) {
+        await tx.accountGroupMember.deleteMany({
+          where: {
+            userId: { in: nonAdminIds },
+            groupId: { not: groupId }
+          }
+        });
+      }
+
+      await tx.device.updateMany({ where: { groupId }, data: { groupId: null } });
+
+      if (memberIds.length > 0) {
+        await tx.accountGroupMember.createMany({
+          data: memberIds.map((userId) => ({ groupId, userId }))
+        });
+      }
+
+      if (deviceCodes.length > 0) {
+        await tx.device.updateMany({
+          where: { deviceCode: { in: deviceCodes } },
+          data: { groupId }
+        });
+      }
+    });
 
     await writeAuditLog(prisma, request, {
       action: "update_account_group",

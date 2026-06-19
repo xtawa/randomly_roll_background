@@ -58,6 +58,14 @@ function buildEmptyDraft() {
   };
 }
 
+function buildEmptyDeviceDraft() {
+  return {
+    deviceCode: "",
+    classroom: "",
+    devModeEnabled: false
+  };
+}
+
 const state = {
   activeView: "enroll",
   apiBaseUrl: resolveInitialApiBaseUrl(),
@@ -90,6 +98,13 @@ const state = {
     enabled: false,
     captures: []
   },
+  deviceDraft: buildEmptyDeviceDraft(),
+  deviceScanner: {
+    active: false,
+    supported: null,
+    error: "",
+    lastDetectedCode: ""
+  },
   draft: buildEmptyDraft(),
   faces: [],
   devices: [],
@@ -101,6 +116,9 @@ const state = {
 
 let liveStream = null;
 let turnstileScriptPromise = null;
+let deviceScannerStream = null;
+let deviceScannerTimer = 0;
+let deviceBarcodeDetector = null;
 
 function escapeHtml(value) {
   return String(value)
@@ -166,6 +184,24 @@ function parseTags(value) {
     .filter(Boolean);
 }
 
+function normalizeGroups(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .map((item) => ({
+      id: String(item?.id || ""),
+      name: String(item?.name || "")
+    }))
+    .filter((item) => item.id && item.name);
+}
+
+function formatGroupNames(groups, emptyLabel = "未加入账号组") {
+  const names = normalizeGroups(groups).map((group) => group.name);
+  return names.length > 0 ? names.join(" / ") : emptyLabel;
+}
+
 function revokeCaptureUrls() {
   state.camera.captures.forEach((capture) => {
     URL.revokeObjectURL(capture.previewUrl);
@@ -181,6 +217,22 @@ function stopCameraTracks() {
     track.stop();
   });
   liveStream = null;
+}
+
+function stopDeviceScannerTracks() {
+  if (deviceScannerTimer) {
+    window.clearTimeout(deviceScannerTimer);
+    deviceScannerTimer = 0;
+  }
+
+  if (!deviceScannerStream) {
+    return;
+  }
+
+  deviceScannerStream.getTracks().forEach((track) => {
+    track.stop();
+  });
+  deviceScannerStream = null;
 }
 
 async function requestApi(path, { method = "GET", body } = {}) {
@@ -388,6 +440,7 @@ async function ensureRegisterProtection() {
 }
 
 function normalizeFaceRecord(item) {
+  const groups = normalizeGroups(item.groups);
   return {
     personId: item.personId,
     displayName: item.displayName,
@@ -399,7 +452,8 @@ function normalizeFaceRecord(item) {
     sampleCount: Number(item.sampleCount || item.descriptorCount || 0),
     updatedAt: item.updatedAt || new Date().toISOString(),
     ownerEmail: item.ownerEmail || "",
-    groupId: item.groupId || ""
+    groupId: item.groupId || groups[0]?.id || "",
+    groups
   };
 }
 
@@ -456,7 +510,10 @@ async function refreshPackages() {
 async function refreshGroups() {
   const payload = await requestApi("/api/admin/groups");
   state.groups = payload.items || [];
-  state.groupUsers = payload.users || [];
+  state.groupUsers = (payload.users || []).map((user) => ({
+    ...user,
+    groupIds: Array.isArray(user.groupIds) ? user.groupIds.map(String) : []
+  }));
   state.groupDevices = payload.devices || [];
 }
 
@@ -575,10 +632,15 @@ function logout() {
 
 function clearSession() {
   stopCameraTracks();
+  stopDeviceScannerTracks();
   state.camera.enabled = false;
+  state.deviceScanner.active = false;
+  state.deviceScanner.error = "";
+  state.deviceScanner.lastDetectedCode = "";
   state.authToken = "";
   state.sessionEmail = "";
   state.account = null;
+  state.deviceDraft = buildEmptyDeviceDraft();
   state.faces = [];
   state.devices = [];
   state.packages = [];
@@ -590,7 +652,11 @@ function clearSession() {
 
 async function loadAccount() {
   const account = await requestApi("/api/auth/me");
-  state.account = account;
+  state.account = {
+    ...account,
+    groups: normalizeGroups(account.groups),
+    group: account.group && account.group.id ? account.group : null
+  };
   state.sessionEmail = account.email;
   persistSession();
 }
@@ -807,6 +873,11 @@ function switchView(nextView) {
     state.camera.enabled = false;
   }
 
+  if (state.activeView === "devices" && nextView !== "devices") {
+    stopDeviceScannerTracks();
+    state.deviceScanner.active = false;
+  }
+
   state.activeView = nextView;
   render();
 }
@@ -858,6 +929,147 @@ function attachCameraStream() {
   video.autoplay = true;
   video.playsInline = true;
   video.play().catch(() => {});
+}
+
+function attachDeviceScannerStream() {
+  const video = document.querySelector("[data-device-scanner-preview]");
+  if (!video || !deviceScannerStream) {
+    return;
+  }
+
+  if (video.srcObject !== deviceScannerStream) {
+    video.srcObject = deviceScannerStream;
+  }
+
+  video.muted = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  video.play().catch(() => {});
+}
+
+async function ensureDeviceScannerSupport() {
+  if (state.deviceScanner.supported === true && deviceBarcodeDetector) {
+    return true;
+  }
+
+  if (!navigator.mediaDevices?.getUserMedia) {
+    state.deviceScanner.supported = false;
+    state.deviceScanner.error = "当前浏览器不支持摄像头扫码，请手动输入设备码。";
+    return false;
+  }
+
+  if (typeof window === "undefined" || typeof window.BarcodeDetector === "undefined") {
+    state.deviceScanner.supported = false;
+    state.deviceScanner.error = "当前浏览器不支持自动扫码，请手动输入设备码。";
+    return false;
+  }
+
+  try {
+    let detector;
+    if (typeof window.BarcodeDetector.getSupportedFormats === "function") {
+      const supportedFormats = await window.BarcodeDetector.getSupportedFormats();
+      const preferredFormats = ["qr_code", "code_128", "code_39", "ean_13", "ean_8", "upc_a", "upc_e"];
+      const formats = preferredFormats.filter((format) => supportedFormats.includes(format));
+      detector = formats.length > 0
+        ? new window.BarcodeDetector({ formats })
+        : new window.BarcodeDetector();
+    } else {
+      detector = new window.BarcodeDetector({ formats: ["qr_code", "code_128", "code_39"] });
+    }
+
+    deviceBarcodeDetector = detector;
+    state.deviceScanner.supported = true;
+    state.deviceScanner.error = "";
+    return true;
+  } catch {
+    state.deviceScanner.supported = false;
+    state.deviceScanner.error = "当前浏览器不支持自动扫码，请手动输入设备码。";
+    return false;
+  }
+}
+
+function scheduleDeviceScannerLoop() {
+  if (!state.deviceScanner.active) {
+    return;
+  }
+
+  deviceScannerTimer = window.setTimeout(() => {
+    void scanDeviceCodeFrame();
+  }, 180);
+}
+
+async function scanDeviceCodeFrame() {
+  if (!state.deviceScanner.active || !deviceScannerStream || !deviceBarcodeDetector) {
+    return;
+  }
+
+  const video = document.querySelector("[data-device-scanner-preview]");
+  if (!video || video.readyState < 2) {
+    scheduleDeviceScannerLoop();
+    return;
+  }
+
+  try {
+    const codes = await deviceBarcodeDetector.detect(video);
+    const match = codes.find((item) => String(item?.rawValue || "").trim());
+
+    if (match) {
+      const deviceCode = String(match.rawValue || "").trim();
+      state.deviceDraft.deviceCode = deviceCode;
+      state.deviceScanner.lastDetectedCode = deviceCode;
+      stopDeviceScannerTracks();
+      state.deviceScanner.active = false;
+      render();
+      setStatus(`已识别设备码 ${deviceCode}，已自动填入。`, "success");
+      return;
+    }
+  } catch {}
+
+  scheduleDeviceScannerLoop();
+}
+
+async function startDeviceScanner() {
+  const supported = await ensureDeviceScannerSupport();
+  if (!supported) {
+    render();
+    setStatus(state.deviceScanner.error, "error");
+    return;
+  }
+
+  try {
+    stopCameraTracks();
+    state.camera.enabled = false;
+    stopDeviceScannerTracks();
+
+    deviceScannerStream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: { ideal: "environment" },
+        width: { ideal: 1280 },
+        height: { ideal: 720 }
+      },
+      audio: false
+    });
+
+    state.deviceScanner.active = true;
+    state.deviceScanner.error = "";
+    render();
+    attachDeviceScannerStream();
+    scheduleDeviceScannerLoop();
+    setStatus("后置摄像头已开启，请将设备码放入取景框。", "success");
+  } catch (error) {
+    stopDeviceScannerTracks();
+    state.deviceScanner.active = false;
+    state.deviceScanner.error = `无法打开扫码摄像头：${error.message}`;
+    render();
+    setStatus(state.deviceScanner.error, "error");
+  }
+}
+
+function stopDeviceScanner() {
+  stopDeviceScannerTracks();
+  state.deviceScanner.active = false;
+  render();
+  setStatus("设备扫码已停止。", "neutral");
 }
 
 async function captureFrame() {
@@ -921,6 +1133,13 @@ function clearCaptures() {
   revokeCaptureUrls();
   state.camera.captures = [];
   render();
+}
+
+function updateDeviceDraftField(fieldName, value) {
+  state.deviceDraft = {
+    ...state.deviceDraft,
+    [fieldName]: value
+  };
 }
 
 async function handleEnrollSubmit(event) {
@@ -1096,12 +1315,15 @@ async function handleDeviceSubmit(event) {
     const payload = await requestApi("/api/admin/devices/pair", {
       method: "POST",
       body: payloadBody
-    });
+      });
 
-    upsertLocalDevice(payload);
-    state.loading = false;
-    setStatus(
-      payload.packageVersion
+      upsertLocalDevice(payload);
+      state.deviceDraft = buildEmptyDeviceDraft();
+      stopDeviceScannerTracks();
+      state.deviceScanner.active = false;
+      state.loading = false;
+      setStatus(
+        payload.packageVersion
         ? `设备 ${deviceCode} 已绑定到 ${classroom}，版本 ${payload.packageVersion} 已生效。`
         : `设备 ${deviceCode} 已绑定到 ${classroom}，暂未指定版本。`,
       "success"
@@ -1707,6 +1929,7 @@ function renderRoster() {
 
 function renderDevices() {
   const canManageDevices = state.account?.role === "admin";
+  const joinedGroupNames = formatGroupNames(state.account?.groups);
   return `
     <section class="panel panel-split">
       ${canManageDevices ? `<form class="form-panel" data-device-form>
@@ -1803,6 +2026,156 @@ function renderGroups() {
           <h3 class="selection-title">设备</h3>
           <div class="selection-grid">
             ${state.groupDevices.map((device) => `<label class="selection-item"><input type="checkbox" name="deviceCodes" value="${escapeHtml(device.deviceCode)}" ${device.groupId === group.id ? "checked" : ""} /><span>${escapeHtml(device.classroom || device.deviceCode)}<small>${escapeHtml(device.deviceCode)}${device.groupId && device.groupId !== group.id ? " · 已在其他组" : ""}</small></span></label>`).join("") || `<div class="empty-card">暂无已登记设备</div>`}
+          </div>
+          <div class="inline-actions"><button class="primary-button" type="submit">保存成员与设备</button></div>
+        </form>
+      `).join("") || `<div class="empty-card">还没有账号组，请先创建。</div>`}
+    </section>
+  `;
+}
+
+function renderDevicesView() {
+  const canManageDevices = state.account?.role === "admin";
+  const joinedGroupNames = formatGroupNames(state.account?.groups);
+
+  return `
+    <section class="panel panel-split">
+      ${canManageDevices ? `<form class="form-panel" data-device-form>
+        <div class="panel-heading compact-head">
+          <div>
+            <div class="section-kicker">设备绑定</div>
+            <h2>把设备连到教室</h2>
+          </div>
+        </div>
+        <div class="form-grid">
+          <label class="field">
+            <span>设备码</span>
+            <input name="deviceCode" data-device-draft="deviceCode" type="text" value="${escapeHtml(state.deviceDraft.deviceCode)}" placeholder="从终端复制或扫码录入设备码" required />
+          </label>
+          <label class="field">
+            <span>教室或班级</span>
+            <input name="classroom" data-device-draft="classroom" type="text" value="${escapeHtml(state.deviceDraft.classroom)}" placeholder="例如：Room 301 / 一年级一班" required />
+          </label>
+          <div class="switch-row">
+            <label><input name="devModeEnabled" data-device-draft="devModeEnabled" type="checkbox" ${state.deviceDraft.devModeEnabled ? "checked" : ""} /> 调试可视化</label>
+          </div>
+        </div>
+        <div class="device-scan-panel">
+          <div class="device-scan-stage">
+            ${state.deviceScanner.active
+              ? `<video class="device-scanner-preview" data-device-scanner-preview></video><div class="camera-overlay"><div class="scan-frame scan-frame-wide"></div><div class="scan-line"></div><div class="camera-tip">将设备码放入框内，识别后自动填入</div></div>`
+              : `<div class="scan-placeholder"><strong>后置摄像头扫码</strong><p>识别二维码或条码后，会自动填入上方设备码输入框。</p></div>`}
+          </div>
+          <div class="inline-actions">
+            ${state.deviceScanner.active
+              ? `<button class="ghost-button" type="button" data-stop-device-scan>停止扫码</button>`
+              : `<button class="ghost-button" type="button" data-start-device-scan>打开扫码</button>`}
+          </div>
+          ${state.deviceScanner.lastDetectedCode ? `<div class="notice-card">最近识别：<span class="mono">${escapeHtml(state.deviceScanner.lastDetectedCode)}</span></div>` : ""}
+          ${state.deviceScanner.supported === false ? `<div class="notice-card notice-card-danger">${escapeHtml(state.deviceScanner.error || "当前浏览器不支持自动扫码，请手动输入设备码。")}</div>` : ""}
+        </div>
+        <div class="notice-card">
+          先完成设备与教室的绑定。版本切换仍可在右侧设备卡片里单独处理，不需要重新绑定。
+        </div>
+        <div class="inline-actions">
+          <button class="primary-button" type="submit">保存设备</button>
+        </div>
+      </form>` : `<section class="form-panel"><div class="section-kicker">组内设备</div><h2>${escapeHtml(joinedGroupNames)}</h2><div class="notice-card">这里只显示管理员分配给当前账号所在账号组的设备。你录入的人脸不会对其他组员可见，管理员发布组版本后设备会自动更新。</div></section>`}
+
+      <div class="panel">
+        <div class="panel-heading compact-head">
+          <div>
+            <div class="section-kicker">已绑定设备</div>
+            <h2>教室列表</h2>
+          </div>
+        </div>
+        <div class="device-list">
+          ${state.devices.map((device) => `
+            <article class="device-card">
+              <div class="device-top">
+                <h3>${escapeHtml(device.classroom)}</h3>
+                <span class="device-state ${device.devModeEnabled ? "accent" : ""}">${device.devModeEnabled ? "调试开" : "正常模式"}</span>
+              </div>
+              <p class="mono">${escapeHtml(device.deviceCode)}</p>
+              <div class="device-meta">当前版本：${escapeHtml(device.packageVersion || "未指定")}</div>
+              <div class="device-meta">绑定时间：${escapeHtml(formatDate(device.pairedAt))}</div>
+              <div class="device-meta">最近同步：${escapeHtml(formatDate(device.lastSeenAt))}</div>
+              ${canManageDevices ? `<form class="inline-form" data-device-version-form>
+                <input name="deviceCode" type="hidden" value="${escapeHtml(device.deviceCode)}" />
+                <select name="packageVersion">
+                  ${renderPackageOptions(device.packageVersion, "清除指定版本")}
+                </select>
+                <button class="ghost-button compact" type="submit">切换版本</button>
+              </form>` : ""}
+            </article>
+          `).join("") || `<div class="empty-card">还没有绑定任何设备，等录入完成并发布版本后再来这里绑定。</div>`}
+        </div>
+      </div>
+    </section>
+  `;
+}
+
+function renderGroupsView() {
+  return `
+    <section class="panel panel-split">
+      <form class="form-panel" data-group-create-form>
+        <div class="panel-heading compact-head">
+          <div>
+            <div class="section-kicker">新建账号组</div>
+            <h2>组织成员与设备</h2>
+          </div>
+        </div>
+        <div class="form-grid">
+          <label class="field">
+            <span>组名称</span>
+            <input name="name" maxlength="80" placeholder="例如：一年级一班" required />
+          </label>
+          <label class="field field-wide">
+            <span>说明</span>
+            <textarea name="description" maxlength="300" placeholder="选填，用于说明用途或负责人"></textarea>
+          </label>
+        </div>
+        <div class="inline-actions"><button class="primary-button" type="submit">创建账号组</button></div>
+      </form>
+      <section class="form-panel">
+        <div class="section-kicker">分配规则</div>
+        <h2>组内隔离</h2>
+        <div class="notice-card">设备仍然只属于一个账号组。普通成员仍只属于一个组，保存到新组时会自动从旧组迁出；管理员可以同时加入多个组。</div>
+        <div class="account-facts"><span>账号组</span><strong>${state.groups.length}</strong><span>可分配账号</span><strong>${state.groupUsers.length}</strong><span>可分配设备</span><strong>${state.groupDevices.length}</strong></div>
+      </section>
+    </section>
+    <section class="group-grid">
+      ${state.groups.map((group) => `
+        <form class="panel group-card" data-group-form>
+          <input type="hidden" name="groupId" value="${escapeHtml(group.id)}" />
+          <div class="panel-heading compact-head">
+            <div>
+              <div class="section-kicker">账号组</div>
+              <h2>${escapeHtml(group.name)}</h2>
+            </div>
+            <button class="ghost-button compact danger-button" type="button" data-delete-group="${escapeHtml(group.id)}">删除</button>
+          </div>
+          <div class="form-grid">
+            <label class="field"><span>组名称</span><input name="name" value="${escapeHtml(group.name)}" required /></label>
+            <label class="field"><span>说明</span><input name="description" value="${escapeHtml(group.description || "")}" /></label>
+          </div>
+          <h3 class="selection-title">成员</h3>
+          <div class="selection-grid">
+            ${state.groupUsers.map((user) => {
+              const groupIds = Array.isArray(user.groupIds) ? user.groupIds : [];
+              const otherGroupIds = groupIds.filter((item) => item !== group.id);
+              const helperText = user.role === "admin"
+                ? `管理员${otherGroupIds.length > 0 ? "，可同时保留其他组权限" : "，可加入多个组"}`
+                : otherGroupIds.length > 0
+                  ? "成员，保存后将从其他组迁移到当前组"
+                  : user.role;
+
+              return `<label class="selection-item"><input type="checkbox" name="memberIds" value="${escapeHtml(user.id)}" ${groupIds.includes(group.id) ? "checked" : ""} /><span>${escapeHtml(user.email)}<small>${escapeHtml(helperText)}</small></span></label>`;
+            }).join("") || `<div class="empty-card">暂无可分配账号</div>`}
+          </div>
+          <h3 class="selection-title">设备</h3>
+          <div class="selection-grid">
+            ${state.groupDevices.map((device) => `<label class="selection-item"><input type="checkbox" name="deviceCodes" value="${escapeHtml(device.deviceCode)}" ${device.groupId === group.id ? "checked" : ""} /><span>${escapeHtml(device.classroom || device.deviceCode)}<small>${escapeHtml(device.deviceCode)}${device.groupId && device.groupId !== group.id ? " / 当前在其他组" : ""}</small></span></label>`).join("") || `<div class="empty-card">暂无已登记设备</div>`}
           </div>
           <div class="inline-actions"><button class="primary-button" type="submit">保存成员与设备</button></div>
         </form>
@@ -1955,9 +2328,9 @@ function renderMain() {
     case "roster":
       return renderRoster();
     case "devices":
-      return renderDevices();
+      return renderDevicesView();
     case "groups":
-      return state.account?.role === "admin" ? renderGroups() : renderHome();
+      return state.account?.role === "admin" ? renderGroupsView() : renderHome();
     case "publish":
       return renderPublish();
     case "settings":
@@ -1990,6 +2363,7 @@ function render() {
 
   bindEvents();
   attachCameraStream();
+  attachDeviceScannerStream();
 }
 
 function bindEvents() {
@@ -2074,6 +2448,19 @@ function bindEvents() {
 
   document.querySelector("[data-enroll-form]")?.addEventListener("submit", handleEnrollSubmit);
   document.querySelector("[data-device-form]")?.addEventListener("submit", handleDeviceSubmit);
+  document.querySelectorAll("[data-device-draft]").forEach((field) => {
+    const eventName = field.type === "checkbox" ? "change" : "input";
+    field.addEventListener(eventName, (event) => {
+      updateDeviceDraftField(
+        field.dataset.deviceDraft,
+        field.type === "checkbox" ? event.currentTarget.checked : event.currentTarget.value
+      );
+    });
+  });
+  document.querySelector("[data-start-device-scan]")?.addEventListener("click", () => {
+    startDeviceScanner();
+  });
+  document.querySelector("[data-stop-device-scan]")?.addEventListener("click", stopDeviceScanner);
   document.querySelectorAll("[data-device-version-form]").forEach((form) => {
     form.addEventListener("submit", handleDeviceVersionSwitch);
   });
@@ -2135,6 +2522,7 @@ async function init() {
 
 window.addEventListener("beforeunload", () => {
   stopCameraTracks();
+  stopDeviceScannerTracks();
   revokeCaptureUrls();
 });
 
