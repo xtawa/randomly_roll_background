@@ -1,19 +1,145 @@
 import bcrypt from "bcryptjs";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
+import { config } from "../config.js";
 import { prisma } from "../db.js";
 import { writeAuditLog } from "../lib/audit.js";
 import { HttpError } from "../lib/http-error.js";
 import { generateCode, generateToken } from "../lib/random.js";
 
+const PUBLIC_EMAIL_DOMAINS = new Set([
+  "gmail.com",
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "msn.com",
+  "qq.com",
+  "foxmail.com",
+  "163.com",
+  "126.com",
+  "yeah.net",
+  "yahoo.com",
+  "yahoo.co.jp",
+  "icloud.com",
+  "me.com",
+  "mac.com",
+  "139.com"
+]);
+
+const emailSchema = z.string().trim().email().transform((value) => value.toLowerCase());
 const credentialsSchema = z.object({
-  email: z.string().email(),
+  email: emailSchema,
   password: z.string().min(8)
 });
 
 const passwordSchema = z.string().min(8).max(128);
+const registrationSchema = credentialsSchema.extend({
+  email: emailSchema.refine(
+    (value) => PUBLIC_EMAIL_DOMAINS.has(value.split("@").at(-1) || ""),
+    "Registration requires a supported public email provider."
+  ),
+  turnstileToken: z.string().trim().min(1).max(2048)
+});
+
+type TurnstileVerificationPayload = {
+  success: boolean;
+  hostname?: string;
+  "error-codes"?: string[];
+};
+
+function normalizeClientIp(value: string | null | undefined) {
+  const rawValue = String(value || "").trim();
+  if (!rawValue) {
+    return "";
+  }
+
+  if (rawValue === "::1") {
+    return "127.0.0.1";
+  }
+
+  if (rawValue.startsWith("::ffff:")) {
+    return rawValue.slice(7);
+  }
+
+  return rawValue.toLowerCase();
+}
+
+function pickForwardedIp(value: string | string[] | undefined) {
+  const joined = Array.isArray(value) ? value[0] : value;
+  return String(joined || "")
+    .split(",")
+    .map((item) => item.trim())
+    .find(Boolean) || "";
+}
+
+function getClientIp(request: FastifyRequest) {
+  return normalizeClientIp(
+    pickForwardedIp(request.headers["cf-connecting-ip"])
+    || pickForwardedIp(request.headers["x-forwarded-for"])
+    || pickForwardedIp(request.headers["x-real-ip"])
+    || request.ip
+  );
+}
+
+async function verifyTurnstileToken(token: string, clientIp: string, request: FastifyRequest) {
+  if (!config.turnstile.enabled) {
+    throw new HttpError(503, "AUTH_CAPTCHA_NOT_CONFIGURED", "Cloudflare Turnstile is not configured on the server.");
+  }
+
+  let payload: TurnstileVerificationPayload;
+
+  try {
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        secret: config.turnstile.secretKey,
+        response: token,
+        remoteip: clientIp
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Turnstile responded with ${response.status}`);
+    }
+
+    payload = (await response.json()) as TurnstileVerificationPayload;
+  } catch (error) {
+    request.log.error({ err: error }, "Turnstile verification request failed.");
+    throw new HttpError(502, "AUTH_CAPTCHA_UPSTREAM_FAILED", "Human verification is temporarily unavailable.");
+  }
+
+  if (payload.success) {
+    return;
+  }
+
+  const errorCodes = payload["error-codes"] || [];
+  request.log.warn(
+    {
+      errorCodes,
+      hostname: payload.hostname || null
+    },
+    "Turnstile verification rejected the registration attempt."
+  );
+
+  if (errorCodes.includes("missing-input-secret") || errorCodes.includes("invalid-input-secret")) {
+    throw new HttpError(503, "AUTH_CAPTCHA_NOT_CONFIGURED", "Cloudflare Turnstile is not configured on the server.");
+  }
+
+  throw new HttpError(400, "AUTH_CAPTCHA_INVALID", "Human verification failed. Please try again.");
+}
 
 export async function registerAuthRoutes(app: FastifyInstance) {
+  app.get("/api/auth/register-config", async () => {
+    return {
+      captchaEnabled: config.turnstile.enabled,
+      turnstileSiteKey: config.turnstile.siteKey || null,
+      registrationLimitPerIp: config.REGISTRATION_LIMIT_PER_IP
+    };
+  });
+
   app.get("/api/auth/me", { preHandler: app.authenticate }, async (request) => {
     const user = await prisma.user.findUnique({
       where: { id: request.authUser!.userId },
@@ -21,6 +147,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
         id: true,
         email: true,
         role: true,
+        group: { select: { id: true, name: true } },
         emailVerified: true,
         createdAt: true,
         updatedAt: true
@@ -35,6 +162,7 @@ export async function registerAuthRoutes(app: FastifyInstance) {
       userId: user.id,
       email: user.email,
       role: user.role,
+      group: user.group,
       emailVerified: user.emailVerified,
       createdAt: user.createdAt.toISOString(),
       updatedAt: user.updatedAt.toISOString()
@@ -42,37 +170,62 @@ export async function registerAuthRoutes(app: FastifyInstance) {
   });
 
   app.post("/api/auth/register", async (request, reply) => {
-    const body = credentialsSchema.parse(request.body);
-    const existingUser = await prisma.user.findUnique({ where: { email: body.email } });
+    const body = registrationSchema.parse(request.body);
+    const clientIp = getClientIp(request);
 
-    if (existingUser) {
-      throw new HttpError(409, "AUTH_EMAIL_EXISTS", "An account with this email already exists.");
+    if (!clientIp) {
+      throw new HttpError(400, "AUTH_IP_UNAVAILABLE", "Unable to determine the client IP for registration.");
     }
+
+    await verifyTurnstileToken(body.turnstileToken, clientIp, request);
 
     const passwordHash = await bcrypt.hash(body.password, 10);
     const code = generateCode();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    const user = await prisma.user.create({
-      data: {
-        email: body.email,
-        passwordHash,
-        role: "editor",
-        emailVerifications: {
-          create: {
-            email: body.email,
-            code,
-            expiresAt
+    const user = await prisma.$transaction(async (tx) => {
+      const existingUser = await tx.user.findUnique({ where: { email: body.email } });
+      if (existingUser) {
+        throw new HttpError(409, "AUTH_EMAIL_EXISTS", "An account with this email already exists.");
+      }
+
+      const registrationsFromIp = await tx.user.count({
+        where: { registrationIp: clientIp }
+      });
+
+      if (registrationsFromIp >= config.REGISTRATION_LIMIT_PER_IP) {
+        throw new HttpError(
+          429,
+          "AUTH_IP_REGISTRATION_LIMIT_REACHED",
+          `This IP address has already registered ${config.REGISTRATION_LIMIT_PER_IP} accounts.`
+        );
+      }
+
+      return tx.user.create({
+        data: {
+          email: body.email,
+          passwordHash,
+          registrationIp: clientIp,
+          role: "member",
+          emailVerifications: {
+            create: {
+              email: body.email,
+              code,
+              expiresAt
+            }
           }
         }
-      }
+      });
     });
 
     await writeAuditLog(prisma, request, {
       action: "register",
       entityType: "user",
       entityId: user.id,
-      after: { email: user.email, role: user.role }
+      after: { email: user.email, role: user.role },
+      metadata: {
+        registrationIp: clientIp
+      }
     });
 
     reply.code(201).send({

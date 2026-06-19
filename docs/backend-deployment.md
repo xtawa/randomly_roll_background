@@ -16,6 +16,7 @@
 
 - 一台可访问公网的 Linux 服务器，建议至少 1 核 CPU、1 GB 内存；
 - 一个域名，例如 `roll.example.com`；
+- 一个 Cloudflare Turnstile 站点，已拿到 `site key` 和 `secret key`；
 - 域名的 A 记录已指向服务器公网 IPv4；
 - 服务器已放行 TCP 端口 `22`、`80`、`443`；
 - 项目代码已上传或克隆到服务器。
@@ -84,6 +85,9 @@ DEFAULT_ADMIN_EMAIL=admin@example.com
 DEFAULT_ADMIN_PASSWORD=请替换为至少8位的强密码
 STORAGE_DIR=/var/lib/randomly-roll/storage
 PUBLIC_BASE_URL=https://roll.example.com
+TURNSTILE_SITE_KEY=请替换为你的Cloudflare站点Key
+TURNSTILE_SECRET_KEY=请替换为你的Cloudflare密钥
+REGISTRATION_LIMIT_PER_IP=2
 ```
 
 生成 JWT 密钥：
@@ -95,6 +99,11 @@ openssl rand -hex 32
 注意：
 
 - 将所有 `roll.example.com` 替换为真实域名；
+- `TURNSTILE_SITE_KEY` 和 `TURNSTILE_SECRET_KEY` 需要在 Cloudflare Turnstile 控制台为当前域名单独创建；
+- `REGISTRATION_LIMIT_PER_IP=2` 表示同一个 IP 最多注册 2 个账号，可按需要调大，但不建议关闭；
+- 新注册账号默认为组成员，只能管理自己的人脸，并且只能查看所在账号组分配到的设备；
+- 管理员在控制台维护账号组，发布时按组打包所有成员的人脸，并自动切换该组全部已配对设备的版本；
+- 注册仅接受 Gmail、Outlook、QQ、163、126、Foxmail、Yahoo、iCloud 等公共邮箱，企业域名邮箱和 Proton 邮箱会被拒绝；
 - 首次初始化数据库前必须修改默认管理员邮箱和密码；
 - `.env` 包含密码和密钥，不要提交到 Git；
 - 后端只监听 `127.0.0.1:3000`，公网访问统一经过 Nginx。

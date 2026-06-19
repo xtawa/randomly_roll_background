@@ -5,7 +5,8 @@ const NAV_ITEMS = [
   { key: "enroll", label: "录入人脸" },
   { key: "roster", label: "名册" },
   { key: "devices", label: "设备" },
-  { key: "publish", label: "发布" },
+  { key: "groups", label: "账号组", adminOnly: true },
+  { key: "publish", label: "发布", adminOnly: true },
   { key: "settings", label: "设置" }
 ];
 
@@ -14,6 +15,14 @@ const LOCAL_KEYS = {
   token: "admin-console-token",
   email: "roll-console-email"
 };
+
+const DRAFT_MODES = {
+  create: "create",
+  edit: "edit",
+  append: "append"
+};
+
+const TURNSTILE_SCRIPT_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
 
 const app = document.getElementById("app");
 
@@ -36,6 +45,19 @@ function resolveInitialApiBaseUrl() {
   return normalizeApiBaseUrl(normalizedSavedValue);
 }
 
+function buildEmptyDraft() {
+  return {
+    mode: DRAFT_MODES.create,
+    personId: "",
+    displayName: "",
+    baseWeight: 1,
+    tags: "",
+    preferred: false,
+    ignored: false,
+    sampleNotes: "正脸 / 微侧脸 / 自然表情"
+  };
+}
+
 const state = {
   activeView: "enroll",
   apiBaseUrl: resolveInitialApiBaseUrl(),
@@ -48,6 +70,16 @@ const state = {
     verificationCode: "",
     resetToken: ""
   },
+  registrationGuard: {
+    configLoadedForApiBaseUrl: "",
+    loading: false,
+    loadError: "",
+    captchaEnabled: false,
+    turnstileSiteKey: "",
+    registrationLimitPerIp: 2,
+    turnstileToken: "",
+    turnstileWidgetId: null
+  },
   status: {
     tone: "neutral",
     message: "准备就绪。可以先登录，再打开摄像头开始录入。"
@@ -58,21 +90,17 @@ const state = {
     enabled: false,
     captures: []
   },
-  draft: {
-    personId: "",
-    displayName: "",
-    baseWeight: 1,
-    tags: "",
-    preferred: false,
-    ignored: false,
-    sampleNotes: "正脸 / 微侧脸 / 自然表情"
-  },
+  draft: buildEmptyDraft(),
   faces: [],
   devices: [],
-  packages: []
+  packages: [],
+  groups: [],
+  groupUsers: [],
+  groupDevices: []
 };
 
 let liveStream = null;
+let turnstileScriptPromise = null;
 
 function escapeHtml(value) {
   return String(value)
@@ -138,10 +166,6 @@ function parseTags(value) {
     .filter(Boolean);
 }
 
-function clampDescriptorCount(value) {
-  return Math.min(5, Math.max(1, Number(value) || 1));
-}
-
 function revokeCaptureUrls() {
   state.camera.captures.forEach((capture) => {
     URL.revokeObjectURL(capture.previewUrl);
@@ -199,6 +223,170 @@ async function requestApi(path, { method = "GET", body } = {}) {
   return payload;
 }
 
+function resetTurnstileState() {
+  const widgetId = state.registrationGuard.turnstileWidgetId;
+
+  if (widgetId !== null && typeof window !== "undefined" && window.turnstile?.remove) {
+    try {
+      window.turnstile.remove(widgetId);
+    } catch {}
+  }
+
+  state.registrationGuard.turnstileWidgetId = null;
+  state.registrationGuard.turnstileToken = "";
+}
+
+function isRegisterProtectionReady() {
+  return state.registrationGuard.captchaEnabled && Boolean(state.registrationGuard.turnstileSiteKey);
+}
+
+function renderRegistrationGuard() {
+  if (state.registrationGuard.loading) {
+    return `<div class="notice-card">正在加载 Cloudflare 人机验证配置…</div>`;
+  }
+
+  if (state.registrationGuard.loadError) {
+    return `<div class="notice-card notice-card-danger">${escapeHtml(state.registrationGuard.loadError)}</div>`;
+  }
+
+  if (!isRegisterProtectionReady()) {
+    return `<div class="notice-card notice-card-danger">管理员尚未配置 Cloudflare Turnstile，当前不能注册新账号。</div>`;
+  }
+
+  return `
+    <div class="turnstile-panel">
+      <span class="turnstile-label">人机验证</span>
+      <div class="turnstile-widget" id="turnstile-register-widget"></div>
+      <p class="turnstile-copy">完成 Cloudflare 验证后才可注册。每个 IP 最多创建 ${state.registrationGuard.registrationLimitPerIp} 个账号。</p>
+    </div>
+  `;
+}
+
+async function loadRegisterConfig({ force = false, silent = true } = {}) {
+  if (state.registrationGuard.loading) {
+    return;
+  }
+
+  if (!force && state.registrationGuard.configLoadedForApiBaseUrl === state.apiBaseUrl) {
+    return;
+  }
+
+  state.registrationGuard.loading = true;
+  state.registrationGuard.loadError = "";
+  resetTurnstileState();
+
+  try {
+    const payload = await requestApi("/api/auth/register-config");
+    state.registrationGuard.configLoadedForApiBaseUrl = state.apiBaseUrl;
+    state.registrationGuard.captchaEnabled = Boolean(payload.captchaEnabled);
+    state.registrationGuard.turnstileSiteKey = String(payload.turnstileSiteKey || "");
+    state.registrationGuard.registrationLimitPerIp = Number(payload.registrationLimitPerIp || 2);
+    state.registrationGuard.loading = false;
+
+    if (!isLoggedIn()) {
+      render();
+    }
+  } catch (error) {
+    state.registrationGuard.loading = false;
+    state.registrationGuard.captchaEnabled = false;
+    state.registrationGuard.turnstileSiteKey = "";
+    state.registrationGuard.loadError = `注册验证配置读取失败：${error.message}`;
+
+    if (!isLoggedIn()) {
+      render();
+    }
+
+    if (!silent) {
+      setStatus(state.registrationGuard.loadError, "error");
+    }
+  }
+}
+
+function loadTurnstileScript() {
+  if (typeof window !== "undefined" && window.turnstile) {
+    return Promise.resolve(window.turnstile);
+  }
+
+  if (turnstileScriptPromise) {
+    return turnstileScriptPromise;
+  }
+
+  turnstileScriptPromise = new Promise((resolve, reject) => {
+    const existingScript = document.querySelector('script[data-turnstile-script="true"]');
+    if (existingScript) {
+      existingScript.addEventListener("load", () => resolve(window.turnstile), { once: true });
+      existingScript.addEventListener("error", () => {
+        turnstileScriptPromise = null;
+        reject(new Error("Turnstile script failed to load."));
+      }, { once: true });
+      return;
+    }
+
+    const script = document.createElement("script");
+    script.src = TURNSTILE_SCRIPT_SRC;
+    script.async = true;
+    script.defer = true;
+    script.dataset.turnstileScript = "true";
+    script.addEventListener("load", () => resolve(window.turnstile), { once: true });
+    script.addEventListener("error", () => {
+      turnstileScriptPromise = null;
+      reject(new Error("Turnstile script failed to load."));
+    }, { once: true });
+    document.head.append(script);
+  });
+
+  return turnstileScriptPromise;
+}
+
+async function mountTurnstileWidget() {
+  if (isLoggedIn() || state.loading || state.authMode !== "register" || !isRegisterProtectionReady()) {
+    return;
+  }
+
+  if (state.registrationGuard.turnstileWidgetId !== null) {
+    return;
+  }
+
+  const container = document.getElementById("turnstile-register-widget");
+  if (!container) {
+    return;
+  }
+
+  try {
+    await loadTurnstileScript();
+
+    if (isLoggedIn() || state.loading || state.authMode !== "register" || state.registrationGuard.turnstileWidgetId !== null) {
+      return;
+    }
+
+    state.registrationGuard.turnstileWidgetId = window.turnstile.render("#turnstile-register-widget", {
+      sitekey: state.registrationGuard.turnstileSiteKey,
+      theme: "light",
+      callback: (token) => {
+        state.registrationGuard.turnstileToken = token;
+      },
+      "expired-callback": () => {
+        state.registrationGuard.turnstileToken = "";
+      },
+      "error-callback": () => {
+        state.registrationGuard.turnstileToken = "";
+      }
+    });
+  } catch {
+    state.registrationGuard.captchaEnabled = false;
+    state.registrationGuard.loadError = "Cloudflare 人机验证脚本加载失败，请稍后重试。";
+    render();
+  }
+}
+
+async function ensureRegisterProtection() {
+  await loadRegisterConfig({ silent: true });
+
+  if (state.authMode === "register" && isRegisterProtectionReady()) {
+    await mountTurnstileWidget();
+  }
+}
+
 function normalizeFaceRecord(item) {
   return {
     personId: item.personId,
@@ -209,7 +397,9 @@ function normalizeFaceRecord(item) {
     tags: Array.isArray(item.tags) ? item.tags : [],
     descriptorCount: Number(item.descriptorCount || item.descriptors || 0),
     sampleCount: Number(item.sampleCount || item.descriptorCount || 0),
-    updatedAt: item.updatedAt || new Date().toISOString()
+    updatedAt: item.updatedAt || new Date().toISOString(),
+    ownerEmail: item.ownerEmail || "",
+    groupId: item.groupId || ""
   };
 }
 
@@ -231,7 +421,9 @@ function normalizePackageRecord(item) {
     notes: item.notes || "",
     peopleCount: Number(item.peopleCount || 0),
     publishedAt: item.publishedAt || new Date().toISOString(),
-    operator: item.operator || state.sessionEmail || "operator@example.com"
+    operator: item.operator || state.sessionEmail || "operator@example.com",
+    groupId: item.groupId || "",
+    groupName: item.groupName || ""
   };
 }
 
@@ -261,6 +453,13 @@ async function refreshPackages() {
   state.packages = (payload.items || []).map(normalizePackageRecord);
 }
 
+async function refreshGroups() {
+  const payload = await requestApi("/api/admin/groups");
+  state.groups = payload.items || [];
+  state.groupUsers = payload.users || [];
+  state.groupDevices = payload.devices || [];
+}
+
 async function refreshAll({ silent = false } = {}) {
   if (!isLoggedIn()) {
     render();
@@ -271,7 +470,14 @@ async function refreshAll({ silent = false } = {}) {
     setLoading(true);
   }
 
-  const results = await Promise.allSettled([refreshFaces(), refreshDevices(), refreshPackages()]);
+  const tasks = [refreshFaces(), refreshDevices()];
+  if (state.account?.role === "admin") {
+    tasks.push(refreshPackages());
+  }
+  if (state.account?.role === "admin") {
+    tasks.push(refreshGroups());
+  }
+  const results = await Promise.allSettled(tasks);
   const hasSuccess = results.some((result) => result.status === "fulfilled");
 
   if (hasSuccess) {
@@ -301,6 +507,10 @@ function upsertLocalFace(record) {
   } else {
     state.faces.unshift(nextRecord);
   }
+}
+
+function removeLocalFace(personId) {
+  state.faces = state.faces.filter((item) => item.personId !== personId);
 }
 
 function upsertLocalDevice(record) {
@@ -372,6 +582,9 @@ function clearSession() {
   state.faces = [];
   state.devices = [];
   state.packages = [];
+  state.groups = [];
+  state.groupUsers = [];
+  state.groupDevices = [];
   persistSession();
 }
 
@@ -388,21 +601,37 @@ async function handleRegister(event) {
   const email = String(formData.get("email") || "").trim();
   const password = String(formData.get("password") || "");
   const confirmPassword = String(formData.get("confirmPassword") || "");
+  const turnstileToken = state.registrationGuard.turnstileToken;
 
   if (password !== confirmPassword) {
     setStatus("两次输入的密码不一致。", "error");
     return;
   }
 
+  if (!isRegisterProtectionReady()) {
+    setStatus("当前服务尚未配置 Cloudflare 人机验证，暂时不能注册。", "error");
+    return;
+  }
+
+  if (!turnstileToken) {
+    setStatus("请先完成人机验证，再提交注册。", "error");
+    return;
+  }
+
   setLoading(true);
   try {
-    const payload = await requestApi("/api/auth/register", { method: "POST", body: { email, password } });
+    const payload = await requestApi("/api/auth/register", {
+      method: "POST",
+      body: { email, password, turnstileToken }
+    });
     state.authContext.email = email;
     state.authContext.verificationCode = payload.verificationCode || "";
     state.authMode = "verify";
+    resetTurnstileState();
     state.loading = false;
     setStatus("账号已创建，请完成邮箱验证。", "success");
   } catch (error) {
+    resetTurnstileState();
     state.loading = false;
     setStatus(`注册失败：${error.message}`, "error");
   }
@@ -499,30 +728,70 @@ async function handleChangePassword(event) {
 function resetDraft() {
   revokeCaptureUrls();
   state.camera.captures = [];
-  state.draft = {
-    personId: "",
-    displayName: "",
-    baseWeight: 1,
-    tags: "",
-    preferred: false,
-    ignored: false,
-    sampleNotes: "正脸 / 微侧脸 / 自然表情"
-  };
+  state.draft = buildEmptyDraft();
 }
 
-function openEnrollDraft(record = null) {
+function getDraftConfig() {
+  switch (state.draft.mode) {
+    case DRAFT_MODES.edit:
+      return {
+        formKicker: "修改资料",
+        formTitle: "更新成员信息",
+        formCopy: "可以只修改资料，也可以顺手补录几张新样本。",
+        cameraTitle: "按需补录样本",
+        cameraCopy: "编辑资料时不强制采样；如果要同步补录，直接打开摄像头即可。",
+        idleCameraTip: "修改资料时可不采样，如需补录再打开摄像头。",
+        activeCameraTip: "如果要补录样本，建议补一到三张不同角度的新照片。",
+        notice: "当前是修改模式。已有成员的编号会保持不变；不采集新样本也可以直接保存。",
+        submitLabel: "保存修改",
+        resetLabel: "取消修改",
+        personIdReadonly: true
+      };
+    case DRAFT_MODES.append:
+      return {
+        formKicker: "补录样本",
+        formTitle: "为成员补充新样本",
+        formCopy: "成员资料可一起调整，但本次至少需要补录 1 张新样本。",
+        cameraTitle: "采集补充样本",
+        cameraCopy: "建议覆盖新的角度、表情或光线条件，提升识别稳定性。",
+        idleCameraTip: "点击“打开摄像头”开始补录样本。",
+        activeCameraTip: "请保持人脸在方框中，至少补录一张新样本。",
+        notice: "当前是补录模式。建议补录 1 到 3 张新样本，避免和历史样本过度重复。",
+        submitLabel: "保存补录",
+        resetLabel: "取消补录",
+        personIdReadonly: true
+      };
+    default:
+      return {
+        formKicker: "录入信息",
+        formTitle: "保存到名册",
+        formCopy: "填写成员资料，并完成首次样本采集。",
+        cameraTitle: "像识别时一样完成采样",
+        cameraCopy: "这里就是实时录入入口。打开摄像头后，直接对着镜头采样。",
+        idleCameraTip: "点击“打开摄像头”开始录入。",
+        activeCameraTip: "请保持人脸在方框中，正脸和微侧脸各采一张。",
+        notice: "建议每个成员首次录入采集 3 到 5 张样本，尽量覆盖正脸、微侧脸和不同表情。",
+        submitLabel: "保存录入",
+        resetLabel: "重新开始",
+        personIdReadonly: false
+      };
+  }
+}
+
+function openEnrollDraft(record = null, mode = DRAFT_MODES.create) {
   revokeCaptureUrls();
   state.camera.captures = [];
 
   if (record) {
     state.draft = {
+      mode,
       personId: record.personId,
       displayName: record.displayName,
       baseWeight: record.baseWeight,
       tags: record.tags.join(", "),
       preferred: record.preferred,
       ignored: record.ignored,
-      sampleNotes: "补充新样本"
+      sampleNotes: mode === DRAFT_MODES.append ? "补充新样本" : "仅修改资料"
     };
   } else {
     resetDraft();
@@ -658,6 +927,7 @@ async function handleEnrollSubmit(event) {
   event.preventDefault();
 
   const formData = new FormData(event.currentTarget);
+  const draftMode = state.draft.mode || DRAFT_MODES.create;
   const displayName = String(formData.get("displayName") || "").trim();
   const personId = String(formData.get("personId") || "").trim() || makePersonId(displayName);
   const baseWeight = Number(formData.get("baseWeight") || 1);
@@ -666,15 +936,24 @@ async function handleEnrollSubmit(event) {
   const ignored = formData.get("ignored") === "on";
   const sampleNotes = String(formData.get("sampleNotes") || "").trim();
   const captureCount = state.camera.captures.length;
-  const exists = state.faces.some((item) => item.personId === personId);
+  const existingRecord = state.faces.find((item) => item.personId === personId);
+  const minimumSamples = draftMode === DRAFT_MODES.create ? 3 : draftMode === DRAFT_MODES.append ? 1 : 0;
 
   if (!displayName) {
     setStatus("请填写姓名或显示名称。", "error");
     return;
   }
 
-  if (captureCount < 3) {
-    setStatus("请至少采集 3 张样本后再保存。", "error");
+  if (draftMode === DRAFT_MODES.create && existingRecord) {
+    setStatus("该编号已存在，请改用“修改”或“补录样本”。", "error");
+    return;
+  }
+
+  if (captureCount < minimumSamples) {
+    setStatus(
+      minimumSamples === 1 ? "请至少补录 1 张新样本后再保存。" : "请至少采集 3 张样本后再保存。",
+      "error"
+    );
     return;
   }
 
@@ -700,46 +979,90 @@ async function handleEnrollSubmit(event) {
       throw new Error("请先在设置页登录。");
     }
 
-    await requestApi(exists ? `/api/admin/faces/${encodeURIComponent(personId)}` : "/api/admin/faces", {
-      method: exists ? "PATCH" : "POST",
+    await requestApi(draftMode === DRAFT_MODES.create ? "/api/admin/faces" : `/api/admin/faces/${encodeURIComponent(personId)}`, {
+      method: draftMode === DRAFT_MODES.create ? "POST" : "PATCH",
       body: profilePayload
     });
 
-    await requestApi(`/api/admin/faces/${encodeURIComponent(personId)}/samples`, {
-      method: "POST",
-      body: uploadBody
-    });
+    if (captureCount > 0) {
+      await requestApi(`/api/admin/faces/${encodeURIComponent(personId)}/samples`, {
+        method: "POST",
+        body: uploadBody
+      });
+    }
 
     upsertLocalFace({
+      ...(existingRecord || {}),
       ...profilePayload,
-      descriptorCount: clampDescriptorCount(captureCount),
-      sampleCount: captureCount,
+      descriptorCount: (existingRecord?.descriptorCount || 0) + captureCount,
+      sampleCount: (existingRecord?.sampleCount || 0) + captureCount,
       updatedAt: new Date().toISOString()
     });
 
     stopCameraTracks();
     state.camera.enabled = false;
-    revokeCaptureUrls();
-    state.camera.captures = [];
+    resetDraft();
     state.loading = false;
     state.activeView = "roster";
     state.status = {
       tone: "success",
-      message: `${displayName} 已录入完成。`
+      message: draftMode === DRAFT_MODES.create
+        ? `${displayName} 已录入完成。`
+        : draftMode === DRAFT_MODES.append
+          ? `${displayName} 的样本已补录。`
+          : `${displayName} 的资料已更新。`
     };
     render();
     await refreshFaces();
     render();
   } catch (error) {
     upsertLocalFace({
+      ...(existingRecord || {}),
       ...profilePayload,
-      descriptorCount: clampDescriptorCount(captureCount),
-      sampleCount: captureCount,
+      descriptorCount: (existingRecord?.descriptorCount || 0) + captureCount,
+      sampleCount: (existingRecord?.sampleCount || 0) + captureCount,
       updatedAt: new Date().toISOString()
     });
 
     state.loading = false;
     setStatus(`服务器暂不可用，已保留本地预览：${error.message}`, "error");
+  }
+}
+
+async function handleFaceDelete(personId) {
+  const record = state.faces.find((item) => item.personId === personId);
+  if (!record) {
+    setStatus("未找到要删除的人脸记录。", "error");
+    return;
+  }
+
+  const confirmed = window.confirm(`确定删除 ${record.displayName}（${record.personId}）吗？此操作会一并删除样本。`);
+  if (!confirmed) {
+    return;
+  }
+
+  setLoading(true);
+
+  try {
+    await requestApi(`/api/admin/faces/${encodeURIComponent(personId)}`, {
+      method: "DELETE"
+    });
+
+    removeLocalFace(personId);
+
+    if (state.draft.personId === personId) {
+      stopCameraTracks();
+      state.camera.enabled = false;
+      resetDraft();
+    }
+
+    state.loading = false;
+    setStatus(`${record.displayName} 已删除。`, "success");
+    await refreshFaces();
+    render();
+  } catch (error) {
+    state.loading = false;
+    setStatus(`删除失败：${error.message}`, "error");
   }
 }
 
@@ -854,13 +1177,19 @@ async function handlePublishSubmit(event) {
   const formData = new FormData(event.currentTarget);
   const version = String(formData.get("version") || "").trim() || suggestVersion();
   const notes = String(formData.get("notes") || "").trim();
+  const groupId = String(formData.get("groupId") || "").trim();
+
+  if (!groupId) {
+    setStatus("请选择要批量发布的账号组。", "error");
+    return;
+  }
 
   setLoading(true);
 
   try {
     const payload = await requestApi("/api/admin/packages/publish", {
       method: "POST",
-      body: { version, notes }
+      body: { version, notes, groupId }
     });
 
     upsertLocalPackage({
@@ -869,25 +1198,81 @@ async function handlePublishSubmit(event) {
       notes,
       peopleCount: payload.peopleCount || state.faces.length,
       publishedAt: payload.publishedAt || new Date().toISOString(),
-      operator: state.sessionEmail || "operator@example.com"
+      operator: state.sessionEmail || "operator@example.com",
+      groupId: payload.groupId || groupId,
+      groupName: payload.groupName || ""
     });
 
     state.loading = false;
-    setStatus(`已发布版本 ${version}。`, "success");
+    setStatus(`已将版本 ${version} 发布到 ${payload.groupName || "所选账号组"}。`, "success");
     await refreshPackages();
     render();
   } catch (error) {
-    upsertLocalPackage({
-      version,
-      isActive: true,
-      notes,
-      peopleCount: state.faces.length,
-      publishedAt: new Date().toISOString(),
-      operator: state.sessionEmail || "operator@example.com"
-    });
-
     state.loading = false;
-    setStatus(`发布结果已保留在本地预览：${error.message}`, "error");
+    setStatus(`发布失败：${error.message}`, "error");
+  }
+}
+
+async function handleGroupCreate(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const name = String(formData.get("name") || "").trim();
+  const description = String(formData.get("description") || "").trim();
+  if (!name) {
+    setStatus("请填写账号组名称。", "error");
+    return;
+  }
+
+  setLoading(true);
+  try {
+    await requestApi("/api/admin/groups", { method: "POST", body: { name, description } });
+    await refreshGroups();
+    state.loading = false;
+    setStatus(`账号组 ${name} 已创建。`, "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`创建账号组失败：${error.message}`, "error");
+  }
+}
+
+async function handleGroupSave(event) {
+  event.preventDefault();
+  const formData = new FormData(event.currentTarget);
+  const groupId = String(formData.get("groupId") || "");
+  const body = {
+    name: String(formData.get("name") || "").trim(),
+    description: String(formData.get("description") || "").trim(),
+    memberIds: formData.getAll("memberIds").map(String),
+    deviceCodes: formData.getAll("deviceCodes").map(String)
+  };
+
+  setLoading(true);
+  try {
+    await requestApi(`/api/admin/groups/${encodeURIComponent(groupId)}`, { method: "PUT", body });
+    await Promise.all([refreshGroups(), refreshFaces(), refreshDevices()]);
+    state.loading = false;
+    setStatus(`账号组 ${body.name} 的成员与设备分配已保存。`, "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`保存账号组失败：${error.message}`, "error");
+  }
+}
+
+async function handleGroupDelete(groupId) {
+  const group = state.groups.find((item) => item.id === groupId);
+  if (!group || !window.confirm(`确定删除账号组“${group.name}”吗？成员和设备将变为未分组。`)) {
+    return;
+  }
+
+  setLoading(true);
+  try {
+    await requestApi(`/api/admin/groups/${encodeURIComponent(groupId)}`, { method: "DELETE" });
+    await refreshGroups();
+    state.loading = false;
+    setStatus(`账号组 ${group.name} 已删除。`, "success");
+  } catch (error) {
+    state.loading = false;
+    setStatus(`删除账号组失败：${error.message}`, "error");
   }
 }
 
@@ -959,11 +1344,12 @@ function renderAuthForm() {
   if (state.authMode === "register") {
     return `
       <form class="auth-form" data-register-form>
-        <div class="auth-heading"><span class="eyebrow">创建账号</span><h1>建立你的点名空间</h1><p>注册后需要验证邮箱，密码至少 8 位。</p></div>
-        <label class="field"><span>邮箱</span><input name="email" type="email" autocomplete="email" required /></label>
+        <div class="auth-heading"><span class="eyebrow">创建账号</span><h1>建立你的点名空间</h1><p>注册前必须先通过 Cloudflare 人机验证，密码至少 8 位。</p></div>
+        <label class="field"><span>邮箱</span><input name="email" type="email" autocomplete="email" placeholder="仅支持 Gmail、Outlook、QQ、163、126、Foxmail 等公共邮箱" required /><small>企业域名邮箱及 Proton 邮箱不可注册。</small></label>
         <label class="field"><span>密码</span><input name="password" type="password" autocomplete="new-password" minlength="8" required /></label>
         <label class="field"><span>确认密码</span><input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
-        <button class="primary-button auth-submit" type="submit">创建账号</button>
+        ${renderRegistrationGuard()}
+        <button class="primary-button auth-submit" type="submit" ${state.registrationGuard.loading || !isRegisterProtectionReady() ? "disabled" : ""}>创建账号</button>
         <button class="text-button" type="button" data-auth-mode="login">已有账号，返回登录</button>
       </form>`;
   }
@@ -1062,7 +1448,7 @@ function renderNav() {
     <aside class="sidebar">
       <div class="nav-title">功能</div>
       <div class="nav-list">
-        ${NAV_ITEMS.map((item) => `
+        ${NAV_ITEMS.filter((item) => !item.adminOnly || state.account?.role === "admin").map((item) => `
           <button class="nav-button ${state.activeView === item.key ? "active" : ""}" data-nav-view="${item.key}" type="button">
             ${item.label}
           </button>
@@ -1175,7 +1561,7 @@ function renderHome() {
               <span>${face.descriptorCount} 个特征样本</span>
               <span>${escapeHtml(face.tags.join(" / ") || "未分类")}</span>
             </div>
-            <button class="ghost-button compact" type="button" data-edit-face="${escapeHtml(face.personId)}">继续录入</button>
+            <button class="ghost-button compact" type="button" data-edit-face="${escapeHtml(face.personId)}">修改资料</button>
           </article>
         `).join("") || `<div class="empty-card">还没有录入任何成员，先去“录入人脸”页打开摄像头。</div>`}
       </div>
@@ -1185,6 +1571,7 @@ function renderHome() {
 
 function renderEnroll() {
   const captureCount = state.camera.captures.length;
+  const draftConfig = getDraftConfig();
 
   return `
     <section class="panel enroll-layout">
@@ -1192,8 +1579,8 @@ function renderEnroll() {
         <div class="panel-heading compact-head">
           <div>
             <div class="section-kicker">实时取景</div>
-            <h2>像识别时一样完成采样</h2>
-            <p class="subcopy">这里就是实时录入入口。打开摄像头后，直接对着镜头采样。</p>
+            <h2>${escapeHtml(draftConfig.cameraTitle)}</h2>
+            <p class="subcopy">${escapeHtml(draftConfig.cameraCopy)}</p>
           </div>
           <div class="inline-actions">
             ${state.camera.enabled
@@ -1207,7 +1594,7 @@ function renderEnroll() {
           <div class="camera-overlay">
             <div class="scan-frame"></div>
             <div class="scan-line"></div>
-            <div class="camera-tip">${state.camera.enabled ? "请保持人脸在方框中，正脸和微侧脸各采一张。" : "点击“打开摄像头”开始录入。"}</div>
+            <div class="camera-tip">${state.camera.enabled ? escapeHtml(draftConfig.activeCameraTip) : escapeHtml(draftConfig.idleCameraTip)}</div>
           </div>
         </div>
         <div class="capture-toolbar">
@@ -1227,8 +1614,9 @@ function renderEnroll() {
       <form class="panel form-panel" data-enroll-form>
         <div class="panel-heading compact-head">
           <div>
-            <div class="section-kicker">录入信息</div>
-            <h2>保存到名册</h2>
+            <div class="section-kicker">${escapeHtml(draftConfig.formKicker)}</div>
+            <h2>${escapeHtml(draftConfig.formTitle)}</h2>
+            <p class="subcopy">${escapeHtml(draftConfig.formCopy)}</p>
           </div>
         </div>
         <div class="form-grid">
@@ -1238,7 +1626,8 @@ function renderEnroll() {
           </label>
           <label class="field">
             <span>编号</span>
-            <input name="personId" type="text" value="${escapeHtml(state.draft.personId)}" placeholder="可留空自动生成" />
+            <input class="${draftConfig.personIdReadonly ? "readonly-input" : ""}" name="personId" type="text" value="${escapeHtml(state.draft.personId)}" placeholder="可留空自动生成" ${draftConfig.personIdReadonly ? "readonly" : ""} />
+            ${draftConfig.personIdReadonly ? '<small class="field-hint">已有成员的编号不可修改。</small>' : ""}
           </label>
           <label class="field">
             <span>标签</span>
@@ -1257,12 +1646,10 @@ function renderEnroll() {
             <label><input name="ignored" type="checkbox" ${state.draft.ignored ? "checked" : ""} /> 暂不参与</label>
           </div>
         </div>
-        <div class="notice-card">
-          建议每个人至少采集 3 张，最多 5 张，尽量覆盖正脸、微侧脸和不同表情。
-        </div>
+        <div class="notice-card">${escapeHtml(draftConfig.notice)}</div>
         <div class="inline-actions">
-          <button class="primary-button" type="submit">保存录入</button>
-          <button class="ghost-button" type="button" data-reset-draft>重新开始</button>
+          <button class="primary-button" type="submit">${escapeHtml(draftConfig.submitLabel)}</button>
+          <button class="ghost-button" type="button" data-reset-draft>${escapeHtml(draftConfig.resetLabel)}</button>
         </div>
       </form>
     </section>
@@ -1277,7 +1664,7 @@ function renderRoster() {
       <div class="panel-heading">
         <div>
           <div class="section-kicker">人脸名册</div>
-          <h2>查看和继续补录</h2>
+          <h2>查看、修改和删除成员</h2>
         </div>
         <div class="inline-actions">
           <input class="search-input" data-search-input type="search" value="${escapeHtml(state.searchQuery)}" placeholder="搜索姓名、编号或标签" />
@@ -1294,17 +1681,22 @@ function renderRoster() {
                 <p class="mono">${escapeHtml(face.personId)}</p>
               </div>
             </div>
-            <div class="chip-row">
+              <div class="chip-row">
               <span class="chip">${face.descriptorCount} 个特征</span>
               <span class="chip">${face.sampleCount} 张样本</span>
               <span class="chip">${face.baseWeight} 倍权重</span>
               ${face.preferred ? `<span class="chip accent">优先</span>` : ""}
               ${face.ignored ? `<span class="chip muted">暂停</span>` : ""}
-            </div>
-            <p class="card-copy">${escapeHtml(face.tags.join(" / ") || "未设置标签")}</p>
+              </div>
+              ${state.account?.role === "admin" ? `<p class="card-copy">归属账号：${escapeHtml(face.ownerEmail || "历史未归属")}</p>` : ""}
+              <p class="card-copy">${escapeHtml(face.tags.join(" / ") || "未设置标签")}</p>
             <div class="card-footer">
               <span>更新于 ${escapeHtml(formatDate(face.updatedAt))}</span>
-              <button class="ghost-button compact" type="button" data-edit-face="${escapeHtml(face.personId)}">继续录入</button>
+              <div class="inline-actions tight-actions">
+                <button class="ghost-button compact" type="button" data-append-face="${escapeHtml(face.personId)}">补录样本</button>
+                <button class="ghost-button compact" type="button" data-edit-face="${escapeHtml(face.personId)}">修改</button>
+                <button class="ghost-button compact danger-button" type="button" data-delete-face="${escapeHtml(face.personId)}">删除</button>
+              </div>
             </div>
           </article>
         `).join("") || `<div class="empty-card">${state.searchQuery ? "没有匹配到结果。" : "名册还是空的，先去“录入人脸”页采集第一位成员。"}</div>`}
@@ -1314,9 +1706,10 @@ function renderRoster() {
 }
 
 function renderDevices() {
+  const canManageDevices = state.account?.role === "admin";
   return `
     <section class="panel panel-split">
-      <form class="form-panel" data-device-form>
+      ${canManageDevices ? `<form class="form-panel" data-device-form>
         <div class="panel-heading compact-head">
           <div>
             <div class="section-kicker">设备绑定</div>
@@ -1342,7 +1735,7 @@ function renderDevices() {
         <div class="inline-actions">
           <button class="primary-button" type="submit">保存设备</button>
         </div>
-      </form>
+      </form>` : `<section class="form-panel"><div class="section-kicker">组内设备</div><h2>${escapeHtml(state.account?.group?.name || "尚未加入账号组")}</h2><div class="notice-card">这里只显示管理员分配给当前账号组的设备。你录入的人脸不会对其他组员可见，管理员发布组版本后设备会自动更新。</div></section>`}
 
       <div class="panel">
         <div class="panel-heading compact-head">
@@ -1362,17 +1755,58 @@ function renderDevices() {
               <div class="device-meta">当前版本：${escapeHtml(device.packageVersion || "未指定")}</div>
               <div class="device-meta">绑定时间：${escapeHtml(formatDate(device.pairedAt))}</div>
               <div class="device-meta">最近同步：${escapeHtml(formatDate(device.lastSeenAt))}</div>
-              <form class="inline-form" data-device-version-form>
+              ${canManageDevices ? `<form class="inline-form" data-device-version-form>
                 <input name="deviceCode" type="hidden" value="${escapeHtml(device.deviceCode)}" />
                 <select name="packageVersion">
                   ${renderPackageOptions(device.packageVersion, "清除指定版本")}
                 </select>
                 <button class="ghost-button compact" type="submit">切换版本</button>
-              </form>
+              </form>` : ""}
             </article>
           `).join("") || `<div class="empty-card">还没有绑定任何设备，等录入完成并发布版本后再来这里绑定。</div>`}
         </div>
       </div>
+    </section>
+  `;
+}
+
+function renderGroups() {
+  return `
+    <section class="panel panel-split">
+      <form class="form-panel" data-group-create-form>
+        <div class="panel-heading compact-head"><div><div class="section-kicker">新建账号组</div><h2>组织成员与设备</h2></div></div>
+        <div class="form-grid">
+          <label class="field"><span>组名称</span><input name="name" maxlength="80" placeholder="例如：一年级一班" required /></label>
+          <label class="field field-wide"><span>说明</span><textarea name="description" maxlength="300" placeholder="选填，用于说明用途或负责人"></textarea></label>
+        </div>
+        <div class="inline-actions"><button class="primary-button" type="submit">创建账号组</button></div>
+      </form>
+      <section class="form-panel">
+        <div class="section-kicker">分配规则</div><h2>组内隔离</h2>
+        <div class="notice-card">每个账号和设备只能属于一个组。成员只能看到自己的脸和本组设备；管理员可查看组内全部成员数据并批量发布。</div>
+        <div class="account-facts"><span>账号组</span><strong>${state.groups.length}</strong><span>可分配账号</span><strong>${state.groupUsers.length}</strong><span>可分配设备</span><strong>${state.groupDevices.length}</strong></div>
+      </section>
+    </section>
+    <section class="group-grid">
+      ${state.groups.map((group) => `
+        <form class="panel group-card" data-group-form>
+          <input type="hidden" name="groupId" value="${escapeHtml(group.id)}" />
+          <div class="panel-heading compact-head"><div><div class="section-kicker">账号组</div><h2>${escapeHtml(group.name)}</h2></div><button class="ghost-button compact danger-button" type="button" data-delete-group="${escapeHtml(group.id)}">删除</button></div>
+          <div class="form-grid">
+            <label class="field"><span>组名称</span><input name="name" value="${escapeHtml(group.name)}" required /></label>
+            <label class="field"><span>说明</span><input name="description" value="${escapeHtml(group.description || "")}" /></label>
+          </div>
+          <h3 class="selection-title">成员</h3>
+          <div class="selection-grid">
+            ${state.groupUsers.map((user) => `<label class="selection-item"><input type="checkbox" name="memberIds" value="${escapeHtml(user.id)}" ${user.groupId === group.id ? "checked" : ""} /><span>${escapeHtml(user.email)}<small>${user.groupId && user.groupId !== group.id ? "已在其他组" : user.role}</small></span></label>`).join("") || `<div class="empty-card">暂无可分配账号</div>`}
+          </div>
+          <h3 class="selection-title">设备</h3>
+          <div class="selection-grid">
+            ${state.groupDevices.map((device) => `<label class="selection-item"><input type="checkbox" name="deviceCodes" value="${escapeHtml(device.deviceCode)}" ${device.groupId === group.id ? "checked" : ""} /><span>${escapeHtml(device.classroom || device.deviceCode)}<small>${escapeHtml(device.deviceCode)}${device.groupId && device.groupId !== group.id ? " · 已在其他组" : ""}</small></span></label>`).join("") || `<div class="empty-card">暂无已登记设备</div>`}
+          </div>
+          <div class="inline-actions"><button class="primary-button" type="submit">保存成员与设备</button></div>
+        </form>
+      `).join("") || `<div class="empty-card">还没有账号组，请先创建。</div>`}
     </section>
   `;
 }
@@ -1388,6 +1822,10 @@ function renderPublish() {
           </div>
         </div>
         <div class="form-grid">
+          <label class="field">
+            <span>目标账号组</span>
+            <select name="groupId" required><option value="">请选择账号组</option>${state.groups.map((group) => `<option value="${escapeHtml(group.id)}">${escapeHtml(group.name)}（${group.members.length} 人 / ${group.devices.length} 台设备）</option>`).join("")}</select>
+          </label>
           <label class="field">
             <span>版本号</span>
             <input name="version" type="text" value="${escapeHtml(suggestVersion())}" />
@@ -1442,6 +1880,7 @@ function renderPublish() {
             </div>
             <div class="package-meta">
               <span>${pkg.peopleCount} 人</span>
+              <span>${escapeHtml(pkg.groupName || "历史全局版本")}</span>
               <span>${escapeHtml(formatDate(pkg.publishedAt))}</span>
               <span>${escapeHtml(pkg.operator || "未知操作人")}</span>
               <span>${pkg.isActive ? "当前使用中" : "历史版本"}</span>
@@ -1454,7 +1893,7 @@ function renderPublish() {
 }
 
 function renderSettings() {
-  const roleLabel = state.account?.role === "admin" ? "管理员" : "编辑人员";
+  const roleLabel = state.account?.role === "admin" ? "管理员" : "组成员";
   return `
     <section class="panel panel-split">
       <section class="form-panel">
@@ -1517,6 +1956,8 @@ function renderMain() {
       return renderRoster();
     case "devices":
       return renderDevices();
+    case "groups":
+      return state.account?.role === "admin" ? renderGroups() : renderHome();
     case "publish":
       return renderPublish();
     case "settings":
@@ -1527,9 +1968,12 @@ function renderMain() {
 }
 
 function render() {
+  resetTurnstileState();
+
   if (!isLoggedIn()) {
     app.innerHTML = renderAuthScreen();
     bindEvents();
+    void ensureRegisterProtection();
     return;
   }
 
@@ -1551,6 +1995,7 @@ function render() {
 function bindEvents() {
   document.querySelectorAll("[data-auth-mode]").forEach((button) => {
     button.addEventListener("click", () => {
+      resetTurnstileState();
       state.authMode = button.dataset.authMode;
       state.status = { tone: "neutral", message: "请填写账号信息。" };
       render();
@@ -1565,6 +2010,11 @@ function bindEvents() {
 
   document.querySelectorAll("[data-quick-view]").forEach((button) => {
     button.addEventListener("click", () => {
+      if (button.dataset.quickView === "enroll") {
+        openEnrollDraft(null, DRAFT_MODES.create);
+        return;
+      }
+
       switchView(button.dataset.quickView);
     });
   });
@@ -1574,7 +2024,16 @@ function bindEvents() {
     const formData = new FormData(event.currentTarget);
     state.apiBaseUrl = normalizeApiBaseUrl(formData.get("apiBaseUrl"));
     persistSession();
+    state.registrationGuard.configLoadedForApiBaseUrl = "";
+    state.registrationGuard.loadError = "";
+    state.registrationGuard.captchaEnabled = false;
+    state.registrationGuard.turnstileSiteKey = "";
+    state.registrationGuard.registrationLimitPerIp = 2;
+    resetTurnstileState();
     setStatus(`已切换服务地址到 ${state.apiBaseUrl}。`, "success");
+    if (!isLoggedIn()) {
+      void loadRegisterConfig({ force: true, silent: false });
+    }
   });
 
   document.querySelector("[data-login-form]")?.addEventListener("submit", async (event) => {
@@ -1605,7 +2064,11 @@ function bindEvents() {
   document.querySelector("[data-reset-draft]")?.addEventListener("click", () => {
     stopCameraTracks();
     state.camera.enabled = false;
+    const shouldReturnToRoster = state.draft.mode !== DRAFT_MODES.create;
     resetDraft();
+    if (shouldReturnToRoster) {
+      state.activeView = "roster";
+    }
     render();
   });
 
@@ -1616,6 +2079,13 @@ function bindEvents() {
   });
   document.querySelector("[data-publish-form]")?.addEventListener("submit", handlePublishSubmit);
   document.querySelector("[data-rollback-form]")?.addEventListener("submit", handleRollbackSubmit);
+  document.querySelector("[data-group-create-form]")?.addEventListener("submit", handleGroupCreate);
+  document.querySelectorAll("[data-group-form]").forEach((form) => {
+    form.addEventListener("submit", handleGroupSave);
+  });
+  document.querySelectorAll("[data-delete-group]").forEach((button) => {
+    button.addEventListener("click", () => handleGroupDelete(button.dataset.deleteGroup));
+  });
 
   document.querySelector("[data-search-input]")?.addEventListener("input", (event) => {
     state.searchQuery = event.currentTarget.value;
@@ -1625,7 +2095,20 @@ function bindEvents() {
   document.querySelectorAll("[data-edit-face]").forEach((button) => {
     button.addEventListener("click", () => {
       const record = state.faces.find((item) => item.personId === button.dataset.editFace);
-      openEnrollDraft(record || null);
+      openEnrollDraft(record || null, DRAFT_MODES.edit);
+    });
+  });
+
+  document.querySelectorAll("[data-append-face]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const record = state.faces.find((item) => item.personId === button.dataset.appendFace);
+      openEnrollDraft(record || null, DRAFT_MODES.append);
+    });
+  });
+
+  document.querySelectorAll("[data-delete-face]").forEach((button) => {
+    button.addEventListener("click", () => {
+      handleFaceDelete(button.dataset.deleteFace);
     });
   });
 

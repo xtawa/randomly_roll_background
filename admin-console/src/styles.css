@@ -213,6 +213,26 @@ video {
   line-height: 1.5;
 }
 
+.turnstile-panel {
+  display: grid;
+  gap: 10px;
+}
+
+.turnstile-label {
+  font-weight: 700;
+}
+
+.turnstile-widget {
+  min-height: 70px;
+}
+
+.turnstile-copy {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
 .account-summary {
   padding: 18px;
   border-radius: 18px;
@@ -356,6 +376,15 @@ video {
 
 .inline-form select {
   flex: 1 1 220px;
+}
+
+.card-footer {
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tight-actions {
+  justify-content: flex-end;
 }
 
 .hero-side {
@@ -809,6 +838,12 @@ video {
   font-weight: 700;
 }
 
+.field-hint {
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
 .field-wide,
 .switch-row {
   grid-column: 1 / -1;
@@ -862,6 +897,12 @@ select:focus {
   border: 1px solid rgba(79, 52, 26, 0.12);
 }
 
+.ghost-button.danger-button {
+  color: var(--danger);
+  border-color: rgba(167, 59, 47, 0.22);
+  background: rgba(167, 59, 47, 0.08);
+}
+
 .primary-button:disabled,
 .ghost-button:disabled {
   opacity: 0.55;
@@ -874,6 +915,11 @@ select:focus {
   padding: 0 12px;
 }
 
+.readonly-input {
+  color: var(--muted);
+  background: rgba(241, 232, 220, 0.92);
+}
+
 .search-input {
   min-width: min(320px, 100%);
 }
@@ -884,6 +930,60 @@ select:focus {
   background: rgba(255, 247, 236, 0.84);
   color: var(--muted);
   line-height: 1.65;
+}
+
+.notice-card-danger {
+  color: var(--danger);
+  background: rgba(167, 59, 47, 0.08);
+  border-color: rgba(167, 59, 47, 0.16);
+}
+
+.group-grid {
+  display: grid;
+  gap: 22px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr));
+}
+
+.group-card {
+  align-self: start;
+}
+
+.selection-title {
+  margin: 24px 0 10px;
+  font-family: "Noto Serif SC", Georgia, serif;
+}
+
+.selection-grid {
+  display: grid;
+  gap: 9px;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+}
+
+.selection-item {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  padding: 11px 13px;
+}
+
+.selection-item input {
+  accent-color: var(--accent);
+  flex: 0 0 auto;
+}
+
+.selection-item span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.selection-item small {
+  color: var(--muted);
+  display: block;
+  margin-top: 3px;
 }
 
 .package-row {

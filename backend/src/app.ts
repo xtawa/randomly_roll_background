@@ -9,6 +9,7 @@ import { authPlugin } from "./plugins/auth.js";
 import { registerAdminRoutes } from "./routes/admin.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerClientRoutes } from "./routes/client.js";
+import { registerGroupRoutes } from "./routes/groups.js";
 
 export async function buildApp() {
   await fs.mkdir(config.storageDir, { recursive: true });
@@ -43,6 +44,7 @@ export async function buildApp() {
   }));
 
   await registerAuthRoutes(app);
+  await registerGroupRoutes(app);
   await registerAdminRoutes(app);
   await registerClientRoutes(app);
 

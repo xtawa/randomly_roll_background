@@ -50,7 +50,10 @@ export async function registerClientRoutes(app: FastifyInstance) {
 
     const activePackage = pairing.packageVersion
       ? await prisma.facePackage.findUnique({ where: { version: pairing.packageVersion } })
-      : await prisma.facePackage.findFirst({ where: { isActive: true }, orderBy: { publishedAt: "desc" } });
+      : await prisma.facePackage.findFirst({
+        where: { isActive: true, groupId: device.groupId },
+        orderBy: { publishedAt: "desc" }
+      });
 
     const latestPackageVersion = activePackage?.version ?? null;
 

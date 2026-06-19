@@ -99,9 +99,12 @@ async function parseMultipartFiles(request: Parameters<FastifyInstance["post"]>[
   return files;
 }
 
-async function buildPackagePayload(version: string) {
+async function buildPackagePayload(version: string, groupId: string) {
   const faceProfiles = await prisma.faceProfile.findMany({
-    where: { isActive: true },
+    where: {
+      isActive: true,
+      ownerUser: { groupId }
+    },
     orderBy: { personId: "asc" },
     include: {
       descriptors: {
@@ -129,16 +132,19 @@ async function buildPackagePayload(version: string) {
 }
 
 export async function registerAdminRoutes(app: FastifyInstance) {
-  const editorGuard = { preHandler: app.requireRole(["admin", "editor"]) };
+  const memberGuard = { preHandler: app.requireRole(["admin", "editor", "member"]) };
   const adminGuard = { preHandler: app.requireRole(["admin"]) };
   const packageVersionSchema = z.string().trim().optional().transform((value) => value || undefined);
 
-  app.get("/api/admin/faces", editorGuard, async () => {
+  app.get("/api/admin/faces", memberGuard, async (request) => {
+    const isAdmin = request.authUser?.role === "admin";
     const records = await prisma.faceProfile.findMany({
+      where: isAdmin ? undefined : { ownerUserId: request.authUser!.userId },
       orderBy: { updatedAt: "desc" },
       include: {
         descriptors: true,
-        samples: true
+        samples: true,
+        ownerUser: { select: { email: true, groupId: true } }
       }
     });
 
@@ -152,12 +158,14 @@ export async function registerAdminRoutes(app: FastifyInstance) {
         tags: parseJson<string[]>(record.tagsJson, []),
         descriptorCount: record.descriptors.length,
         sampleCount: record.samples.length,
+        ownerEmail: record.ownerUser?.email ?? null,
+        groupId: record.ownerUser?.groupId ?? null,
         updatedAt: record.updatedAt.toISOString()
       }))
     };
   });
 
-  app.post("/api/admin/faces", editorGuard, async (request, reply) => {
+  app.post("/api/admin/faces", memberGuard, async (request, reply) => {
     const body = faceSchema.parse(request.body);
     const existing = await prisma.faceProfile.findUnique({ where: { personId: body.personId } });
     if (existing) {
@@ -171,7 +179,8 @@ export async function registerAdminRoutes(app: FastifyInstance) {
         preferred: body.preferred,
         ignored: body.ignored,
         baseWeight: body.baseWeight,
-        tagsJson: toJson(body.tags)
+        tagsJson: toJson(body.tags),
+        ownerUserId: request.authUser?.role === "admin" ? null : request.authUser!.userId
       }
     });
 
@@ -188,11 +197,14 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     });
   });
 
-  app.patch("/api/admin/faces/:id", editorGuard, async (request) => {
+  app.patch("/api/admin/faces/:id", memberGuard, async (request) => {
     const personId = z.string().trim().min(1).parse((request.params as { id: string }).id);
     const body = faceUpdateSchema.parse(request.body);
     const existing = await prisma.faceProfile.findUnique({ where: { personId } });
     if (!existing) {
+      throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
+    }
+    if (request.authUser?.role !== "admin" && existing.ownerUserId !== request.authUser?.userId) {
       throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
     }
 
@@ -233,10 +245,57 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     };
   });
 
-  app.post("/api/admin/faces/:id/samples", editorGuard, async (request, reply) => {
+  app.delete("/api/admin/faces/:id", memberGuard, async (request, reply) => {
+    const personId = z.string().trim().min(1).parse((request.params as { id: string }).id);
+    const existing = await prisma.faceProfile.findUnique({
+      where: { personId },
+      include: {
+        descriptors: true,
+        samples: true
+      }
+    });
+
+    if (!existing) {
+      throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
+    }
+    if (request.authUser?.role !== "admin" && existing.ownerUserId !== request.authUser?.userId) {
+      throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
+    }
+
+    await prisma.faceProfile.delete({
+      where: { personId }
+    });
+
+    await fs.rm(path.join(config.storageDir, "uploads", personId), {
+      recursive: true,
+      force: true
+    });
+
+    await writeAuditLog(prisma, request, {
+      action: "delete_face_profile",
+      entityType: "face_profile",
+      entityId: personId,
+      before: {
+        displayName: existing.displayName,
+        preferred: existing.preferred,
+        ignored: existing.ignored,
+        baseWeight: existing.baseWeight,
+        tags: parseJson<string[]>(existing.tagsJson, []),
+        descriptorCount: existing.descriptors.length,
+        sampleCount: existing.samples.length
+      }
+    });
+
+    reply.code(204).send();
+  });
+
+  app.post("/api/admin/faces/:id/samples", memberGuard, async (request, reply) => {
     const faceId = z.string().trim().min(1).parse((request.params as { id: string }).id);
     const profile = await prisma.faceProfile.findUnique({ where: { personId: faceId } });
     if (!profile) {
+      throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
+    }
+    if (request.authUser?.role !== "admin" && profile.ownerUserId !== request.authUser?.userId) {
       throw new HttpError(404, "FACE_PROFILE_NOT_FOUND", "The requested face profile does not exist.");
     }
 
@@ -290,8 +349,17 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     });
   });
 
-  app.get("/api/admin/devices", editorGuard, async () => {
+  app.get("/api/admin/devices", memberGuard, async (request) => {
+    const currentUser = request.authUser?.role === "admin"
+      ? null
+      : await prisma.user.findUnique({
+        where: { id: request.authUser!.userId },
+        select: { groupId: true }
+      });
     const devices = await prisma.device.findMany({
+      where: request.authUser?.role === "admin"
+        ? undefined
+        : { groupId: currentUser?.groupId || "__unassigned__" },
       orderBy: { updatedAt: "desc" },
       include: {
         pairings: {
@@ -317,7 +385,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     };
   });
 
-  app.post("/api/admin/devices/pair", editorGuard, async (request) => {
+  app.post("/api/admin/devices/pair", adminGuard, async (request) => {
     const body = z.object({
       deviceCode: z.string().trim().min(8),
       classroom: z.string().trim().min(1),
@@ -377,7 +445,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     };
   });
 
-  app.patch("/api/admin/devices/:deviceCode/package", editorGuard, async (request) => {
+  app.patch("/api/admin/devices/:deviceCode/package", adminGuard, async (request) => {
     const deviceCode = z.string().trim().min(1).parse((request.params as { deviceCode: string }).deviceCode);
     const body = z.object({
       packageVersion: packageVersionSchema
@@ -438,10 +506,10 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get("/api/admin/packages", editorGuard, async () => {
+  app.get("/api/admin/packages", adminGuard, async () => {
     const packages = await prisma.facePackage.findMany({
       orderBy: { publishedAt: "desc" },
-      include: { packagePeople: true, publishedBy: true }
+      include: { packagePeople: true, publishedBy: true, group: true }
     });
 
     return {
@@ -451,7 +519,9 @@ export async function registerAdminRoutes(app: FastifyInstance) {
         notes: pkg.notes,
         peopleCount: pkg.packagePeople.length,
         publishedAt: pkg.publishedAt.toISOString(),
-        operator: pkg.publishedBy?.email ?? null
+        operator: pkg.publishedBy?.email ?? null,
+        groupId: pkg.groupId,
+        groupName: pkg.group?.name ?? null
       }))
     };
   });
@@ -459,19 +529,25 @@ export async function registerAdminRoutes(app: FastifyInstance) {
   app.post("/api/admin/packages/publish", adminGuard, async (request, reply) => {
     const body = z.object({
       version: z.string().trim().min(1),
-      notes: z.string().trim().optional().default("")
+      notes: z.string().trim().optional().default(""),
+      groupId: z.string().trim().min(1)
     }).parse(request.body);
+
+    const group = await prisma.accountGroup.findUnique({ where: { id: body.groupId } });
+    if (!group) {
+      throw new HttpError(404, "GROUP_NOT_FOUND", "The requested account group does not exist.");
+    }
 
     const existing = await prisma.facePackage.findUnique({ where: { version: body.version } });
     if (existing) {
       throw new HttpError(409, "PUBLISH_CONFLICT", "This package version already exists.");
     }
 
-    const payload = await buildPackagePayload(body.version);
+    const payload = await buildPackagePayload(body.version, body.groupId);
 
     const created = await prisma.$transaction(async (tx) => {
       await tx.facePackage.updateMany({
-        where: { isActive: true },
+        where: { isActive: true, groupId: body.groupId },
         data: { isActive: false }
       });
 
@@ -481,6 +557,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
           notes: body.notes,
           payloadJson: toJson(payload),
           isActive: true,
+          groupId: body.groupId,
           publishedById: request.authUser?.userId ?? null
         }
       });
@@ -501,6 +578,11 @@ export async function registerAdminRoutes(app: FastifyInstance) {
         });
       }
 
+      await tx.devicePairing.updateMany({
+        where: { isActive: true, device: { groupId: body.groupId } },
+        data: { packageVersion: body.version }
+      });
+
       return facePackage;
     });
 
@@ -511,6 +593,8 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       after: {
         version: body.version,
         notes: body.notes,
+        groupId: body.groupId,
+        groupName: group.name,
         peopleCount: payload.people.length
       }
     });
@@ -519,6 +603,8 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       version: created.version,
       publishedAt: created.publishedAt.toISOString(),
       peopleCount: payload.people.length,
+      groupId: body.groupId,
+      groupName: group.name,
       downloadUrl: new URL(`/api/client/packages/${encodeURIComponent(created.version)}`, config.PUBLIC_BASE_URL).toString()
     });
   });
@@ -532,12 +618,16 @@ export async function registerAdminRoutes(app: FastifyInstance) {
 
     await prisma.$transaction([
       prisma.facePackage.updateMany({
-        where: { isActive: true },
+        where: { isActive: true, groupId: target.groupId },
         data: { isActive: false }
       }),
       prisma.facePackage.update({
         where: { version },
         data: { isActive: true }
+      }),
+      prisma.devicePairing.updateMany({
+        where: { isActive: true, device: { groupId: target.groupId } },
+        data: { packageVersion: version }
       })
     ]);
 
@@ -552,7 +642,7 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     };
   });
 
-  app.get("/api/admin/audit-logs", editorGuard, async () => {
+  app.get("/api/admin/audit-logs", adminGuard, async () => {
     const logs = await prisma.auditLog.findMany({
       orderBy: { createdAt: "desc" },
       take: 200
