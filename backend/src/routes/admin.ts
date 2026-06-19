@@ -1,6 +1,5 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { MultipartFile } from "@fastify/multipart";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { config } from "../config.js";
@@ -24,25 +23,29 @@ const faceUpdateSchema = faceSchema.omit({ personId: true }).partial().extend({
   tags: z.array(z.string().trim().min(1)).optional()
 });
 
-async function saveUploadedFile(personId: string, file: MultipartFile) {
+type UploadedSampleFile = {
+  filename: string;
+  mimetype: string;
+  buffer: Buffer;
+};
+
+async function saveUploadedFile(personId: string, file: UploadedSampleFile) {
   const ext = path.extname(file.filename || "");
   const directory = path.join(config.storageDir, "uploads", personId);
   await fs.mkdir(directory, { recursive: true });
 
-  const buffer = await file.toBuffer();
   const storedFileName = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}${ext}`;
   const storedPath = path.join(directory, storedFileName);
 
-  await fs.writeFile(storedPath, buffer);
+  await fs.writeFile(storedPath, file.buffer);
 
   return {
-    buffer,
     storedFileName,
     storedPath
   };
 }
 
-async function buildSampleEntries(requestBody: unknown, faceId: string, files: MultipartFile[]) {
+async function buildSampleEntries(requestBody: unknown, faceId: string, files: UploadedSampleFile[]) {
   if (files.length > 0) {
     const notes = typeof (requestBody as Record<string, unknown> | undefined)?.notes === "string"
       ? String((requestBody as Record<string, unknown>).notes)
@@ -55,9 +58,9 @@ async function buildSampleEntries(requestBody: unknown, faceId: string, files: M
         originalFileName: file.filename,
         storedFileName: saved.storedFileName,
         mimeType: file.mimetype,
-        sizeBytes: saved.buffer.byteLength,
+        sizeBytes: file.buffer.byteLength,
         qualityScore: 0.9,
-        descriptor: buildDescriptor(saved.buffer)
+        descriptor: buildDescriptor(file.buffer)
       };
     }));
   }
@@ -79,16 +82,20 @@ async function buildSampleEntries(requestBody: unknown, faceId: string, files: M
   }));
 }
 
-async function parseMultipartFiles(request: Parameters<FastifyInstance["post"]>[1] extends never ? never : any): Promise<MultipartFile[]> {
+async function parseMultipartFiles(request: Parameters<FastifyInstance["post"]>[1] extends never ? never : any): Promise<UploadedSampleFile[]> {
   if (!request.isMultipart()) {
     return [];
   }
 
-  const files: MultipartFile[] = [];
+  const files: UploadedSampleFile[] = [];
   const parts = request.parts();
   for await (const part of parts) {
     if (part.type === "file") {
-      files.push(part);
+      files.push({
+        filename: part.filename,
+        mimetype: part.mimetype,
+        buffer: await part.toBuffer()
+      });
     } else {
       request.body = {
         ...(typeof request.body === "object" && request.body ? request.body : {}),
